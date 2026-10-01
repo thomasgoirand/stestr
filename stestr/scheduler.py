@@ -28,7 +28,9 @@ def get_dynamic_test_list(
     _group_callback = group_callback
     time_data = {}
     if randomize:
-        return random.shuffle(test_ids)
+        test_ids = list(test_ids)
+        random.shuffle(test_ids)
+        return test_ids
     if repository:
         time_data = repository.get_test_times(test_ids)
         timed_tests = time_data["known"]
@@ -80,11 +82,13 @@ def get_dynamic_test_list(
     # the current (lowest time, shortest length[in tests])
     def consume_queue(groups):
         queue = sorted(groups.items(), key=operator.itemgetter(1), reverse=True)
-        dynamic_test_list.extend([group[0] for group in queue])
+        for group_id, _duration in queue:
+            dynamic_test_list.extend(group_ids[group_id])
 
     consume_queue(timed)
     consume_queue(partial)
-    dynamic_test_list.extend(unknown)
+    for group_id in unknown:
+        dynamic_test_list.extend(group_ids[group_id])
 
     return dynamic_test_list
 

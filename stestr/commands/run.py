@@ -717,7 +717,6 @@ def run_command(
                     suppress_attachments=suppress_attachments,
                     all_attachments=all_attachments,
                     show_binary_attachments=show_binary_attachments,
-                    dynamic=dynamic,
                 )
                 if run_result > result:
                     result = run_result
@@ -736,7 +735,6 @@ def run_command(
                 suppress_attachments=suppress_attachments,
                 all_attachments=all_attachments,
                 show_binary_attachments=show_binary_attachments,
-                dynamic=dynamic,
             )
     else:
         # Where do we source data about the cause of conflicts.
@@ -806,14 +804,17 @@ def _run_tests(
     suppress_attachments=False,
     all_attachments=False,
     show_binary_attachments=False,
-    dynamic=False,
 ):
     """Run the tests cmd was parameterised with."""
     cmd.setUp()
     try:
 
         def run_tests():
-            if not dynamic or cmd.concurrency == 1:
+            # The dynamic scheduling mode returns a dict of a multiprocessing
+            # Process and the read end of a pipe from the worker, instead of
+            # a subprocess.Popen object. The mode used is determined by the
+            # fixture, checking cmd.dynamic ensures both always agree.
+            if not cmd.dynamic or cmd.concurrency == 1:
                 run_procs = [
                     ("subunit", output.ReturnCodeToSubunit(proc, dynamic=False))
                     for proc in cmd.run_tests()
@@ -823,7 +824,7 @@ def _run_tests(
                     (
                         "subunit",
                         output.ReturnCodeToSubunit(
-                            os.fdopen(proc["stream"]), proc["proc"]
+                            os.fdopen(proc["stream"], "rb"), proc["proc"]
                         ),
                     )
                     for proc in cmd.run_tests()

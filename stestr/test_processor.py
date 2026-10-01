@@ -31,6 +31,56 @@ from stestr.subunit_runner import run
 from stestr import testlist
 
 
+def _dynamic_worker(job_queue, subunit_pipe):
+    """Run test ids from a queue until the sentinel is received.
+
+    This is the target function used by the worker processes spawned for
+    dynamic scheduling. Each worker pulls a single test id at a time from
+    the shared queue and runs it, writing the subunit output to the write
+    end of a pipe that is read by the parent process. After the test list
+    the parent enqueues a None sentinel per worker, and a worker exits as
+    soon as it receives one. This guarantees a worker only exits after
+    every test id was handed to some worker, without any race on an
+    empty() check between workers.
+
+    :param job_queue: The queue with the test ids to run, shared by all
+        the workers of a run.
+    :param subunit_pipe: The write end of the pipe used to send the
+        subunit output of the tests back to the parent process.
+    """
+    # NOTE(mtreinish): Duplicate the file descriptor of the pipe so the
+    # writer is decoupled from the Connection object's lifetime. Without
+    # this you'll be fighting random bad file descriptor errors.
+    subunit_stream = os.fdopen(os.dup(subunit_pipe.fileno()), "wb")
+    # The non-dynamic mode loads the test ids from a subprocess started
+    # with python -m which puts the current working directory on sys.path.
+    # Do the same here so the tests of the project under test are
+    # importable by name in the worker.
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+    # Point the worker's stdout at the subunit stream (buffered text, the
+    # same as what a subprocess runner gets) so that any output the tests
+    # write is captured in the subunit stream instead of leaking into the
+    # parent's console.
+    sys.stdout = io.TextIOWrapper(subunit_stream)
+    try:
+        while True:
+            test_id = job_queue.get()
+            if test_id is None:
+                break
+            cmd_list = ["stestr", test_id]
+            test_runner = run.SubunitTestRunner
+            program.TestProgram(
+                module=None,
+                argv=cmd_list,
+                testRunner=functools.partial(test_runner, stdout=sys.stdout),
+            )
+    finally:
+        sys.stdout.flush()
+        subunit_stream.close()
+
+
 class TestProcessorFixture(fixtures.Fixture):
     """Write a temporary file to disk with test ids in it.
 
@@ -255,31 +305,6 @@ class TestProcessorFixture(fixtures.Fixture):
         ids = testlist.parse_enumeration(out)
         return ids
 
-    def _dynamic_run_tests(self, job_queue, subunit_pipe):
-        while True:
-            # NOTE(mtreinish): Open on each loop iteration with a dup to
-            # remove the chance of being garbage collected. Without this
-            # you'll be fighting random Bad file desciptor errors
-            subunit_pipe = os.fdopen(os.dup(subunit_pipe.fileno()), "wb")
-            if job_queue.empty():
-                subunit_pipe.close()
-                return
-            try:
-                test_id = job_queue.get(block=False)
-            except Exception:
-                subunit_pipe.close()
-                return
-            if not test_id:
-                os.close(subunit_pipe.fileno())
-                raise ValueError("Invalid blank test_id: %s" % test_id)
-            cmd_list = [self.cmd, test_id]
-            test_runner = run.SubunitTestRunner
-            program.TestProgram(
-                module=None,
-                argv=cmd_list,
-                testRunner=functools.partial(test_runner, stdout=subunit_pipe),
-            )
-
     def run_tests(self):
         """Run the tests defined by the command
 
@@ -332,26 +357,44 @@ class TestProcessorFixture(fixtures.Fixture):
             test_id_list = scheduler.get_dynamic_test_list(
                 test_ids, self.repository, self._group_callback
             )
+            if not test_id_list:
+                # Nothing to run, return an empty list of processes so the
+                # caller can report that nothing matched.
+                return result
             # Use spawn to launch a fresh interpreter and have the minimal
             # amount of state from stestr when invoking the test runner.
             # This is equivalent to non-dynamic mode using subprocess instead
             # of multiprocessing.
             context = multiprocessing.get_context("spawn")
+            # NOTE(mtreinish): The queue is scoped to the instance so it
+            # stays alive as long as the fixture does. If it was garbage
+            # collected while the workers are still running, the finalizer
+            # of its internal locks would unlink the underlying semaphores
+            # and any worker that is still starting would crash with a
+            # FileNotFoundError when rebuilding the queue.
             self._test_list_queue = context.Queue()
 
             for test_id in test_id_list:
                 self._test_list_queue.put(test_id)
+            # Enqueue a sentinel per worker. A worker exits when it receives
+            # a sentinel, so every worker exits only after all the test ids
+            # were handed to a worker.
+            for _ in range(self.concurrency):
+                self._test_list_queue.put(None)
 
             for i in range(self.concurrency):
                 fd_pipe_r, fd_pipe_w = context.Pipe(False)
-                name = "worker-%s" % i
-                context.Value
                 proc = context.Process(
-                    target=self._dynamic_run_tests,
-                    name=name,
-                    args=[self._test_list_queue, fd_pipe_w],
+                    target=_dynamic_worker,
+                    name="worker-%s" % i,
+                    args=(self._test_list_queue, fd_pipe_w),
                 )
                 proc.start()
+                # The parent never writes to the pipe. Close its write end
+                # immediately so the reader sees EOF as soon as the workers
+                # exit instead of only when the parent cleans up.
+                fd_pipe_w.close()
                 stream_read = os.dup(fd_pipe_r.fileno())
+                fd_pipe_r.close()
                 result.append({"stream": stream_read, "proc": proc})
             return result

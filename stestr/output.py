@@ -177,6 +177,8 @@ class ReturnCodeToSubunit:
         self.lastoutput = bytes((b"\n")[0])
 
     def __del__(self):
+        if not self.proc:
+            return
         if hasattr(self.proc, "wait"):
             self.proc.wait()
         else:
@@ -211,7 +213,7 @@ class ReturnCodeToSubunit:
 
     def read(self, count=-1):
         if count == 0:
-            return ""
+            return b""
         result = self.source.read(count)
         if result:
             self.lastoutput = result[-1]

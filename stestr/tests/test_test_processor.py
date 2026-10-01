@@ -10,8 +10,15 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import io
+import multiprocessing
+import os
+import queue
 import subprocess
 from unittest import mock
+
+import subunit
+import testtools
 
 from stestr import test_processor
 from stestr.tests import base
@@ -53,3 +60,115 @@ class TestTestProcessorFixture(base.TestCase):
         self._check_start_process(
             platform="linux2", expected_fn=self._fixture._clear_SIGPIPE
         )
+
+
+def _parse_subunit_output(raw):
+    case = subunit.ByteStreamToStreamResult(io.BytesIO(raw))
+    tests = []
+
+    def _add_test(test):
+        tests.append(test)
+
+    outcomes = testtools.StreamToDict(_add_test)
+    result = testtools.CopyStreamResult([testtools.StreamResult(), outcomes])
+    result.startTestRun()
+    try:
+        case.run(result)
+    finally:
+        result.stopTestRun()
+    return tests
+
+
+def _read_connection_output(read_conn):
+    chunks = []
+    while True:
+        try:
+            chunk = os.read(read_conn.fileno(), 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+class TestDynamicWorker(base.TestCase):
+    # A stable, importable test id from this module used to exercise the
+    # worker without spawning processes.
+    _test_id = (
+        "stestr.tests.test_test_processor"
+        ".TestTestProcessorFixture.test_start_process_linux"
+    )
+
+    def _run_worker(self, job_queue):
+        ctx = multiprocessing.get_context("spawn")
+        read_conn, write_conn = ctx.Pipe(False)
+        test_processor._dynamic_worker(job_queue, write_conn)
+        write_conn.close()
+        return _read_connection_output(read_conn)
+
+    def test_dynamic_worker_exits_on_sentinel(self):
+        job_queue = queue.Queue()
+        job_queue.put(None)
+        out = self._run_worker(job_queue)
+        self.assertEqual(b"", out)
+
+    def test_dynamic_worker_runs_queued_tests(self):
+        job_queue = queue.Queue()
+        job_queue.put(self._test_id)
+        job_queue.put(None)
+        out = self._run_worker(job_queue)
+        tests = _parse_subunit_output(out)
+        statuses = {test["id"]: test["status"] for test in tests}
+        self.assertIn(self._test_id, statuses)
+        self.assertEqual("success", statuses[self._test_id])
+
+    def test_dynamic_worker_sentinel_after_tests(self):
+        # A worker must exit cleanly when it receives the sentinel, even if
+        # other workers already consumed part of the queue.
+        job_queue = queue.Queue()
+        for _ in range(3):
+            job_queue.put(None)
+        out = self._run_worker(job_queue)
+        self.assertEqual(b"", out)
+
+
+class TestProcessorDynamicRun(base.TestCase):
+    _test_id = (
+        "stestr.tests.test_test_processor"
+        ".TestTestProcessorFixture.test_start_process_linux"
+    )
+
+    def _get_dynamic_fixture(self, test_ids, concurrency=2):
+        fixture = test_processor.TestProcessorFixture(
+            test_ids,
+            "python -m stestr.subunit_runner.run $IDOPTION",
+            "--list",
+            "--load-list $IDFILE",
+            None,
+            concurrency=concurrency,
+            dynamic=True,
+        )
+        return self.useFixture(fixture)
+
+    def test_dynamic_run_tests_returns_worker_dicts(self):
+        fixture = self._get_dynamic_fixture([self._test_id])
+        workers = fixture.run_tests()
+        self.assertEqual(2, len(workers))
+        outputs = []
+        for worker in workers:
+            self.assertIn("stream", worker)
+            self.assertIn("proc", worker)
+            worker["proc"].join()
+            self.assertEqual(0, worker["proc"].exitcode)
+            with os.fdopen(worker["stream"], "rb") as stream:
+                outputs.append(stream.read())
+        tests = _parse_subunit_output(b"".join(outputs))
+        statuses = {test["id"]: test["status"] for test in tests}
+        self.assertIn(self._test_id, statuses)
+        self.assertEqual("success", statuses[self._test_id])
+
+    def test_dynamic_run_tests_no_tests(self):
+        fixture = self._get_dynamic_fixture([])
+        workers = fixture.run_tests()
+        self.assertEqual([], workers)

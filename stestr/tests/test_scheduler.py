@@ -212,3 +212,49 @@ class TestScheduler(base.TestCase):
             ["test_a", "test_b", "your_test"],
         ]
         self.assertEqual(expected_grouping, groups)
+
+    def test_get_dynamic_test_list(self):
+        repo = memory.RepositoryFactory().initialise("memory:")
+        result = repo.get_inserter()
+        result.startTestRun()
+        self._add_timed_test("slow", 3, result)
+        self._add_timed_test("fast1", 2, result)
+        self._add_timed_test("fast2", 1, result)
+        result.stopTestRun()
+        test_ids = ["slow", "fast1", "fast2", "unknown1", "unknown2"]
+        dynamic_test_list = scheduler.get_dynamic_test_list(test_ids, repo)
+        # The groups with known durations are scheduled first from the
+        # slowest to the fastest, the groups with unknown time come last.
+        self.assertEqual(
+            ["slow", "fast1", "fast2", "unknown1", "unknown2"], dynamic_test_list
+        )
+
+    def test_get_dynamic_test_list_randomize(self):
+        repo = memory.RepositoryFactory().initialise("memory:")
+        test_ids = ["a_test", "b_test", "c_test"]
+        dynamic_test_list = scheduler.get_dynamic_test_list(
+            test_ids, repo, randomize=True
+        )
+        # randomize=True must return a list of the test ids (and not the
+        # None returned by random.shuffle)
+        self.assertIsInstance(dynamic_test_list, list)
+        self.assertEqual(sorted(test_ids), sorted(dynamic_test_list))
+
+    def test_get_dynamic_test_list_with_grouping(self):
+        test_ids = [
+            "tests.test_a.FakeTestClass.test_one",
+            "tests.test_a.FakeTestClass.test_two",
+            "tests.test_b.FakeTestClass.test_one",
+        ]
+
+        def group_callback(test_id):
+            return test_id.rpartition(".")[0]
+
+        dynamic_test_list = scheduler.get_dynamic_test_list(
+            test_ids, None, group_callback
+        )
+        # The ids scheduled for the workers must be the full test ids of
+        # each group, not the group ids themselves.
+        self.assertEqual(sorted(test_ids), sorted(dynamic_test_list))
+        for test_id in dynamic_test_list:
+            self.assertFalse(test_id.endswith("."))
