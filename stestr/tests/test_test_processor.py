@@ -17,6 +17,7 @@ import queue
 import subprocess
 from unittest import mock
 
+import fixtures
 import subunit
 import testtools
 
@@ -172,3 +173,58 @@ class TestProcessorDynamicRun(base.TestCase):
         fixture = self._get_dynamic_fixture([])
         workers = fixture.run_tests()
         self.assertEqual([], workers)
+
+
+class TestDynamicDiscoverySeeding(base.TestCase):
+    def test_worker_discovers_test_tree_before_running(self):
+        # The dynamic workers must import the whole test tree the same way
+        # the non-dynamic runner subprocesses do, because projects rely on
+        # the import side effects of the test modules (e.g. test models
+        # registering into a shared sqlalchemy metadata at import time).
+        top_dir = self.useFixture(fixtures.TempDir()).path
+        side_effect = os.path.join(top_dir, "test_side_effect.py")
+        with open(side_effect, "w") as f:
+            f.write(
+                "import os\n"
+                "with open(os.path.join(os.path.dirname(__file__), "
+                "'marker'), 'w') as marker:\n"
+                "    marker.write('discovered')\n"
+            )
+        user_test = os.path.join(top_dir, "test_user.py")
+        with open(user_test, "w") as f:
+            f.write(
+                "import os\n"
+                "import unittest\n"
+                "\n"
+                "\n"
+                "class TestDiscoverySeeding(unittest.TestCase):\n"
+                "    def test_side_effect_ran(self):\n"
+                "        marker = os.path.join(\n"
+                "            os.path.dirname(__file__), 'marker')\n"
+                "        self.assertTrue(os.path.exists(marker))\n"
+            )
+        fixture = test_processor.TestProcessorFixture(
+            ["test_user.TestDiscoverySeeding.test_side_effect_ran"],
+            "python -m stestr.subunit_runner.run $IDOPTION",
+            "--list",
+            "--load-list $IDFILE",
+            None,
+            concurrency=2,
+            dynamic=True,
+            test_path=top_dir,
+            top_dir=top_dir,
+        )
+        self.useFixture(fixture)
+        workers = fixture.run_tests()
+        outputs = []
+        for worker in workers:
+            worker["proc"].join()
+            self.assertEqual(0, worker["proc"].exitcode)
+            with os.fdopen(worker["stream"], "rb") as stream:
+                outputs.append(stream.read())
+        tests = _parse_subunit_output(b"".join(outputs))
+        statuses = {test["id"]: test["status"] for test in tests}
+        self.assertEqual(
+            "success",
+            statuses["test_user.TestDiscoverySeeding.test_side_effect_ran"],
+        )

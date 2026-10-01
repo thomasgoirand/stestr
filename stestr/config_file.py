@@ -21,6 +21,19 @@ from stestr.repository import util
 from stestr import test_processor
 
 
+def _expand_shell_default(path):
+    """Expand the ${VAR:-default} form used in the config test_path.
+
+    That value is normally expanded by the shell when the runner
+    subprocess is started, but the dynamic scheduler workers need the
+    resolved path to run their own discovery of the test tree.
+    """
+    match = re.fullmatch(r"\$\{(\w+):-(.*)}", path)
+    if match:
+        return os.environ.get(match.group(1)) or match.group(2)
+    return path
+
+
 class TestrConf:
     """Create a TestrConf object to represent a specified config file
 
@@ -176,8 +189,10 @@ class TestrConf:
         if not top_dir and not self.top_dir:
             top_dir = "./"
 
-        test_path = self._sanitize_path(test_path or self.test_path)
-        top_dir = self._sanitize_path(top_dir or self.top_dir)
+        test_path = self._sanitize_path(
+            _expand_shell_default(test_path or self.test_path)
+        )
+        top_dir = self._sanitize_path(_expand_shell_default(top_dir or self.top_dir))
 
         stestr_python = sys.executable
         # let's try to be explicit, even if it means a longer set of ifs
@@ -239,4 +254,6 @@ class TestrConf:
             include_list=include_list,
             randomize=randomize,
             dynamic=dynamic,
+            test_path=test_path,
+            top_dir=top_dir,
         )

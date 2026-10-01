@@ -81,6 +81,8 @@ class TestTestrConf(base.TestCase):
             serial=False,
             include_list=None,
             worker_path=None,
+            test_path="fake_test_path",
+            top_dir="fake_top_dir",
         )
 
     @mock.patch.object(config_file, "sys")
@@ -108,6 +110,44 @@ class TestTestrConf(base.TestCase):
         self._check_get_run_command(
             platform="linux2", expected_python="/usr/bin/python"
         )
+
+    def test_expand_shell_default_unset_variable(self):
+        environment = {"OTHER": "value"}
+        with mock.patch.dict("os.environ", environment, clear=True):
+            self.assertEqual(
+                "./neutron/tests/unit",
+                config_file._expand_shell_default(
+                    "${OS_TEST_PATH:-./neutron/tests/unit}"
+                ),
+            )
+
+    def test_expand_shell_default_set_variable(self):
+        environment = {"OS_TEST_PATH": "./neutron/tests/functional"}
+        with mock.patch.dict("os.environ", environment, clear=True):
+            self.assertEqual(
+                "./neutron/tests/functional",
+                config_file._expand_shell_default(
+                    "${OS_TEST_PATH:-./neutron/tests/unit}"
+                ),
+            )
+
+    def test_expand_shell_default_empty_variable(self):
+        environment = {"OS_TEST_PATH": ""}
+        with mock.patch.dict("os.environ", environment, clear=True):
+            self.assertEqual(
+                "./neutron/tests/unit",
+                config_file._expand_shell_default(
+                    "${OS_TEST_PATH:-./neutron/tests/unit}"
+                ),
+            )
+
+    def test_expand_shell_default_plain_path(self):
+        environment = {"OTHER": "value"}
+        with mock.patch.dict("os.environ", environment, clear=True):
+            self.assertEqual(
+                "./neutron/tests/unit",
+                config_file._expand_shell_default("./neutron/tests/unit"),
+            )
 
     def test_get_run_command_emptysysexecutable_noenv(self):
         self._check_get_run_command_exception(platform="linux2", sys_executable=None)

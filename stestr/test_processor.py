@@ -10,7 +10,6 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import functools
 import io
 import multiprocessing
 import os
@@ -19,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import unittest
 
 import fixtures
 from subunit import v2
@@ -31,7 +31,7 @@ from stestr.subunit_runner import run
 from stestr import testlist
 
 
-def _dynamic_worker(job_queue, subunit_pipe):
+def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
     """Run test ids from a queue until the sentinel is received.
 
     This is the target function used by the worker processes spawned for
@@ -47,6 +47,12 @@ def _dynamic_worker(job_queue, subunit_pipe):
         the workers of a run.
     :param subunit_pipe: The write end of the pipe used to send the
         subunit output of the tests back to the parent process.
+    :param test_path: The path of the test tree. When set, the worker
+        loads the whole tree with a unittest discovery first, like the
+        runner subprocesses of the non-dynamic mode do, and runs the
+        discovered tests matched by id. Optional.
+    :param top_dir: The top level directory used by that discovery.
+        Optional.
     """
     # NOTE(mtreinish): Duplicate the file descriptor of the pipe so the
     # writer is decoupled from the Connection object's lifetime. Without
@@ -59,23 +65,46 @@ def _dynamic_worker(job_queue, subunit_pipe):
     cwd = os.getcwd()
     if cwd not in sys.path:
         sys.path.insert(0, cwd)
+    # The non-dynamic runner subprocess is started with
+    # `python -m stestr.subunit_runner.run`, so sys.argv[0] is the path of
+    # the run module. Some projects derive names from it, e.g. the
+    # iptables filter chains of Neutron, so present the same value here.
+    sys.argv = [run.__file__]
     # Point the worker's stdout at the subunit stream (buffered text, the
     # same as what a subprocess runner gets) so that any output the tests
     # write is captured in the subunit stream instead of leaking into the
     # parent's console.
     sys.stdout = io.TextIOWrapper(subunit_stream)
     try:
+        test_map = {}
+        if test_path:
+            # The non-dynamic mode runs the tests of a worker from a
+            # subprocess that loads the whole test tree through a unittest
+            # discovery and then filters it by the test ids. Mirror it
+            # here, so that a worker starts with the same loaded state as
+            # a non-dynamic runner: some projects rely on those import
+            # side effects, e.g. test models that register into a shared
+            # sqlalchemy metadata when their module is imported, and
+            # without them the tables of those models are never created
+            # in the test databases. It also gives the actual test
+            # objects to run, matched by id: the unittest name loader
+            # cannot resolve the ids generated dynamically by ddt.
+            discovered = unittest.defaultTestLoader.discover(
+                test_path, top_level_dir=top_dir
+            )
+            for test in program.iterate_tests(discovered):
+                test_map[test.id()] = test
         while True:
             test_id = job_queue.get()
             if test_id is None:
                 break
-            cmd_list = ["stestr", test_id]
-            test_runner = run.SubunitTestRunner
-            program.TestProgram(
-                module=None,
-                argv=cmd_list,
-                testRunner=functools.partial(test_runner, stdout=sys.stdout),
-            )
+            if test_path:
+                test = test_map.get(test_id)
+                if test is None:
+                    continue
+            else:
+                test = unittest.defaultTestLoader.loadTestsFromName(test_id)
+            run.SubunitTestRunner(stdout=sys.stdout).run(test)
     finally:
         sys.stdout.flush()
         subunit_stream.close()
@@ -128,6 +157,14 @@ class TestProcessorFixture(fixtures.Fixture):
          contains a separate regex on each newline.
     :param boolean randomize: Randomize the test order after they are
         partitioned into separate workers
+    :param bool dynamic: Use the experimental dynamic scheduler, workers
+        will ask for the next test to run instead of being assigned a
+        partition up front
+    :param str test_path: The path of the test tree, used by the dynamic
+        scheduler to run a full discovery in each worker, mirroring the
+        non-dynamic runner subprocesses. Optional.
+    :param str top_dir: The top level directory of the project, used
+        together with test_path by the dynamic scheduler. Optional.
     """
 
     def __init__(
@@ -149,6 +186,8 @@ class TestProcessorFixture(fixtures.Fixture):
         include_list=None,
         randomize=False,
         dynamic=False,
+        test_path=None,
+        top_dir=None,
     ):
         """Create a TestProcessorFixture."""
 
@@ -171,6 +210,8 @@ class TestProcessorFixture(fixtures.Fixture):
         self.exclude_regex = exclude_regex
         self.randomize = randomize
         self.dynamic = dynamic
+        self.test_path = test_path
+        self.top_dir = top_dir
 
     def setUp(self):
         super().setUp()
@@ -387,7 +428,12 @@ class TestProcessorFixture(fixtures.Fixture):
                 proc = context.Process(
                     target=_dynamic_worker,
                     name="worker-%s" % i,
-                    args=(self._test_list_queue, fd_pipe_w),
+                    args=(
+                        self._test_list_queue,
+                        fd_pipe_w,
+                        self.test_path,
+                        self.top_dir,
+                    ),
                 )
                 proc.start()
                 # The parent never writes to the pipe. Close its write end
