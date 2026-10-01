@@ -160,32 +160,51 @@ class ReturnCodeToSubunit:
     subunit stream consumers. If the process closes its stdout and then does
     not terminate, reading from the ReturnCodeToSubunit stream will hang.
 
-    :param process: A subprocess.Popen object that is
-        generating subunit.
+    :param process: A subprocess.Popen object that is generating subunit.
+        When dynamic is true, the read side of the subunit stream of a
+        dynamic scheduler worker instead (a binary file object).
+    :param worker: The multiprocessing.Process of the dynamic scheduler
+        worker that generated the stream. Only used when dynamic is true.
+    :param bool dynamic: Adapt the stream of a dynamic scheduler worker
+        instead of a subprocess.Popen. Defaults to False.
     """
 
-    def __init__(self, process):
+    def __init__(self, process, worker=None, dynamic=False):
         """Adapt a process to a readable stream."""
-        self.proc = process
         self.done = False
-        self.source = self.proc.stdout
-        self.lastoutput = bytes((b"\n")[0])
+        self.dynamic = dynamic
+        if dynamic:
+            self.source = process
+            self.proc = worker
+        else:
+            self.proc = process
+            self.source = self.proc.stdout
+        self.lastoutput = b"\n"
 
     def __del__(self):
-        self.proc.wait()
+        if not self.proc:
+            return
+        if hasattr(self.proc, "wait"):
+            self.proc.wait()
+        else:
+            self.proc.join()
 
     def _append_return_code_as_test(self):
         if self.done is True:
             return
         self.source = io.BytesIO()
-        returncode = self.proc.wait()
+        if not self.dynamic:
+            returncode = self.proc.wait()
+        else:
+            self.proc.join()
+            returncode = self.proc.exitcode
         if returncode != 0:
-            if self.lastoutput != bytes((b"\n")[0]):
+            if self.lastoutput != b"\n":
                 # Subunit V1 is line orientated, it has to start on a fresh
                 # line. V2 needs to start on any fresh utf8 character border
                 # - which is not guaranteed in an arbitrary stream endpoint, so
                 # injecting a \n gives us such a guarantee.
-                self.source.write(bytes("\n"))
+                self.source.write(b"\n")
             stream = subunit.StreamResultToBytes(self.source)
             stream.status(
                 test_id="process-returncode",
@@ -199,10 +218,10 @@ class ReturnCodeToSubunit:
 
     def read(self, count=-1):
         if count == 0:
-            return ""
+            return b""
         result = self.source.read(count)
         if result:
-            self.lastoutput = result[-1]
+            self.lastoutput = result[-1:]
             return result
         self._append_return_code_as_test()
         return self.source.read(count)
@@ -210,7 +229,7 @@ class ReturnCodeToSubunit:
     def readline(self):
         result = self.source.readline()
         if result:
-            self.lastoutput = result[-1]
+            self.lastoutput = result[-1:]
             return result
         self._append_return_code_as_test()
         return self.source.readline()
@@ -218,7 +237,7 @@ class ReturnCodeToSubunit:
     def readlines(self):
         result = self.source.readlines()
         if result:
-            self.lastoutput = result[-1][-1]
+            self.lastoutput = result[-1][-1:]
         self._append_return_code_as_test()
         result.extend(self.source.readlines())
         return result

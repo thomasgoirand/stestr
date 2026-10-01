@@ -19,6 +19,7 @@ import os
 import os.path
 import subprocess
 import sys
+import warnings
 
 from cliff import command
 import subunit
@@ -245,6 +246,19 @@ class Run(command.Command):
             help="If set, show non-text attachments. This is "
             "generally only useful for debug purposes.",
         )
+        parser.add_argument(
+            "--dynamic",
+            action="store_true",
+            default=False,
+            help="Enable the EXPERIMENTAL dynamic scheduler. This scheduler "
+            "is designed to to improve the worker balance. Each worker will "
+            "dynamically query the next test to run which can potentially "
+            "result in better wall time. This option is still experimental "
+            "and is not guaranteed to work in all cases. This option is also not "
+            "currently supported on Windows. If you encounter issues with this "
+            "option please file a bug at: "
+            "https://github.com/mtreinish/stestr/issues/new?template=bug_report.md",
+        )
         return parser
 
     def take_action(self, parsed_args):
@@ -336,6 +350,7 @@ class Run(command.Command):
             all_attachments=all_attachments,
             show_binary_attachments=args.show_binary_attachments,
             pdb=args.pdb,
+            dynamic=args.dynamic,
         )
 
         # Always output slowest test info if requested, regardless of other
@@ -397,6 +412,7 @@ def run_command(
     all_attachments=False,
     show_binary_attachments=True,
     pdb=False,
+    dynamic=False,
 ):
     """Function to execute the run command
 
@@ -461,11 +477,24 @@ def run_command(
     :param str pdb: Takes in a single test_id to bypasses test
         discover and just execute the test specified without launching any
         additional processes. A file name may be used in place of a test name.
+    :param bool dynamic: Enable dynamic scheduling
 
     :return return_code: The exit code for the command. 0 for success and > 0
         for failures.
     :rtype: int
     """
+    if dynamic and sys.platform == "win32":
+        msg = "The dynamic scheduler is not supported on Windows\n"
+        stdout.write(msg)
+        return 2
+    if dynamic and any((isolated, analyze_isolation, no_discover, pdb, worker_path)):
+        msg = (
+            "--dynamic cannot be combined with --isolated, "
+            "--analyze-isolation, --no-discover, --pdb or --worker-file: "
+            "the dynamic scheduler does not support them\n"
+        )
+        stdout.write(msg)
+        return 2
     try:
         repo = util.get_repo_open(repo_url=repo_url)
     # If a repo is not found, and there a stestr config exists just create it
@@ -502,6 +531,11 @@ def run_command(
         )
         stdout.write(msg)
         return 2
+    if dynamic:
+        warnings.warn(
+            "WARNING: The dynamic scheduler is still experimental. "
+            "You might encounter issues while using it"
+        )
     if combine:
         latest_id = repo.latest_id()
         combine_id = str(latest_id)
@@ -654,6 +688,7 @@ def run_command(
             top_dir=top_dir,
             test_path=test_path,
             randomize=random,
+            dynamic=dynamic,
         )
         if isolated:
             result = 0
@@ -786,10 +821,27 @@ def _run_tests(
     try:
 
         def run_tests():
-            run_procs = [
-                ("subunit", output.ReturnCodeToSubunit(proc))
-                for proc in cmd.run_tests()
-            ]
+            # The dynamic scheduling mode returns a dict of a multiprocessing
+            # Process and the read end of a pipe from the worker, instead of
+            # a subprocess.Popen object. The mode used is determined by the
+            # fixture, checking cmd.dynamic ensures both always agree.
+            if not cmd.dynamic or cmd.concurrency == 1:
+                run_procs = [
+                    ("subunit", output.ReturnCodeToSubunit(proc))
+                    for proc in cmd.run_tests()
+                ]
+            else:
+                run_procs = [
+                    (
+                        "subunit",
+                        output.ReturnCodeToSubunit(
+                            os.fdopen(proc["stream"], "rb"),
+                            worker=proc["proc"],
+                            dynamic=True,
+                        ),
+                    )
+                    for proc in cmd.run_tests()
+                ]
             if not run_procs:
                 stdout.write("The specified regex doesn't match with anything")
                 return 1

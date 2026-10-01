@@ -11,6 +11,7 @@
 # under the License.
 
 import io
+from unittest import mock
 
 from stestr.commands import run
 from stestr.tests import base
@@ -42,3 +43,30 @@ class TestRunCommand(base.TestCase):
         expected = 'Unable to convert "None" to an integer.  ' "Using 0.\n"
         self.assertEqual(fake_stderr.getvalue(), expected)
         self.assertEqual(0, out)
+
+    def test_dynamic_refused_on_win32(self):
+        stdout = io.StringIO()
+        with mock.patch("sys.platform", "win32"):
+            ret = run.run_command(dynamic=True, stdout=stdout)
+        self.assertEqual(2, ret)
+        self.assertEqual(
+            "The dynamic scheduler is not supported on Windows\n",
+            stdout.getvalue(),
+        )
+
+    def test_dynamic_refused_with_unsupported_options(self):
+        # The dynamic scheduler cannot honor these options: they must be
+        # rejected instead of silently falling back to the static
+        # scheduler.
+        for kwargs in (
+            {"isolated": True},
+            {"analyze_isolation": True},
+            {"no_discover": "some_test"},
+            {"pdb": "some_test"},
+            {"worker_path": "workers.yaml"},
+        ):
+            with self.subTest(**kwargs):
+                stdout = io.StringIO()
+                ret = run.run_command(dynamic=True, stdout=stdout, **kwargs)
+                self.assertEqual(2, ret)
+                self.assertIn("cannot be combined", stdout.getvalue())

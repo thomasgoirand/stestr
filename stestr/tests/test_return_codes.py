@@ -18,7 +18,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import unittest
 
 import fixtures
 import subunit as subunit_lib
@@ -94,7 +96,6 @@ class TestReturnCodes(base.TestCase):
                 "%s" % cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             out, err = p.communicate()
-
         if not subunit:
             self.assertEqual(
                 p.returncode,
@@ -429,6 +430,61 @@ class TestReturnCodes(base.TestCase):
         stdout = fixtures.StringStream("stdout")
         self.useFixture(stdout)
         self.assertEqual(1, run.run_command(concurrency="1", stdout=stdout.stream))
+
+    @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
+    def test_dynamic_passing(self):
+        self.assertRunExit("stestr run --dynamic --concurrency 2 passing", 0)
+
+    @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
+    def test_dynamic_fails(self):
+        # A dynamic run with failing tests exits 1 like the parallel one.
+        self.assertRunExit("stestr run --dynamic --concurrency 2", 1)
+
+    @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
+    def test_dynamic_run_set_generated_ids(self):
+        # Test generators like ddt derive the generated test ids from the
+        # iteration order of sets (e.g. @ddt.data(*a_frozenset)), which
+        # depends on the per-process hash seed: the listing process and
+        # the workers must share one seed, or the workers cannot find the
+        # listed tests.
+        with open(os.path.join(self.test_dir, "test_setgen.py"), "w") as f:
+            f.write(
+                "import unittest\n"
+                "_STATES = frozenset(\n"
+                "    ('active', 'adopting', 'available', 'cleaning', 'enroll',\n"
+                "     'error', 'manageable', 'rescue', 'rescuing', 'servicing',\n"
+                "     'unrescuing', 'verifying'))\n"
+                "\n"
+                "\n"
+                "class TestSetGen(unittest.TestCase):\n"
+                "    def test_destroy(self, state):\n"
+                "        pass\n"
+                "\n"
+                "\n"
+                "for _i, _s in enumerate(_STATES):\n"
+                "    def _m(self, _s=_s):\n"
+                "        pass\n"
+                "    setattr(TestSetGen, 'test_destroy_%d_%s' % (_i, _s), _m)\n"
+                "delattr(TestSetGen, 'test_destroy')\n"
+            )
+        out, err = self.assertRunExit("stestr run --dynamic --concurrency 2 setgen", 0)
+        self.assertIn("Passed: 12", out.decode())
+
+    @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
+    def test_dynamic_subunit_failing(self):
+        self.assertRunExit(
+            "stestr run --dynamic --concurrency 2 --subunit failing",
+            0,
+            subunit=True,
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
+    def test_dynamic_subunit_passing(self):
+        self.assertRunExit(
+            "stestr run --dynamic --concurrency 2 passing --subunit",
+            0,
+            subunit=True,
+        )
 
     def test_serial_fails_from_func(self):
         stdout = fixtures.StringStream("stdout")

@@ -11,6 +11,11 @@
 # under the License.
 
 import io
+import subprocess
+from unittest import mock
+
+import subunit
+import testtools
 
 from stestr import output
 from stestr.tests import base
@@ -84,3 +89,125 @@ class TestOutput(base.TestCase):
             )
             actual = f.getvalue()
             self.assertEqual(expected, actual)
+
+
+class FakeProcess:
+    """A stand-in for a multiprocessing.Process in ReturnCodeToSubunit."""
+
+    def __init__(self, exitcode):
+        self.exitcode = exitcode
+        self.joined = False
+
+    def join(self, timeout=None):
+        self.joined = True
+
+
+class FakePopen:
+    """A stand-in for a subprocess.Popen in ReturnCodeToSubunit."""
+
+    def __init__(self, stdout, returncode):
+        self.stdout = stdout
+        self.returncode = returncode
+
+    def wait(self):
+        return self.returncode
+
+
+def _parse_output(raw):
+    case = subunit.ByteStreamToStreamResult(io.BytesIO(raw))
+    tests = []
+
+    def _add_test(test):
+        tests.append(test)
+
+    outcomes = testtools.StreamToDict(_add_test)
+    result = testtools.CopyStreamResult([outcomes])
+    result.startTestRun()
+    try:
+        case.run(result)
+    finally:
+        result.stopTestRun()
+    return tests
+
+
+class TestReturnCodeToSubunit(base.TestCase):
+    def test_popen_is_the_default(self):
+        # Without dynamic the first argument is a subprocess.Popen and the
+        # adapted stream is its stdout: the meaning of the arguments must
+        # not flip for the classic runners of the documented API.
+        popen = mock.Mock(spec=subprocess.Popen)
+        popen.stdout = io.BytesIO(b"")
+        popen.wait.return_value = 0
+        rcs = output.ReturnCodeToSubunit(popen)
+        self.assertIs(rcs.proc, popen)
+        self.assertIs(rcs.source, popen.stdout)
+        self.assertFalse(rcs.dynamic)
+        self.assertEqual(b"", rcs.read())
+
+    def test_dynamic_return_code_appended(self):
+        # A worker that emitted output before crashing must still get the
+        # synthetic failure appended.
+        proc = FakeProcess(3)
+        rcs = output.ReturnCodeToSubunit(
+            io.BytesIO(b"some worker output\n"), worker=proc, dynamic=True
+        )
+        self.assertTrue(rcs.dynamic)
+        out = rcs.read()
+        self.assertEqual(b"some worker output\n", out)
+        tests = _parse_output(rcs.read())
+        self.assertTrue(proc.joined)
+        self.assertIn(
+            ("process-returncode", "fail"),
+            [(test["id"], test["status"]) for test in tests],
+        )
+
+    def test_dynamic_return_code_after_partial_line(self):
+        # Subunit v1 is line orientated: when the worker's output did not
+        # end on a fresh line, a newline is injected before the synthetic
+        # test.
+        proc = FakeProcess(3)
+        rcs = output.ReturnCodeToSubunit(
+            io.BytesIO(b"partial output"), worker=proc, dynamic=True
+        )
+        self.assertEqual(b"partial output", rcs.read())
+        rest = rcs.read()
+        self.assertTrue(rest.startswith(b"\n"))
+        tests = _parse_output(rest[1:])
+        self.assertIn(
+            ("process-returncode", "fail"),
+            [(test["id"], test["status"]) for test in tests],
+        )
+
+    def test_dynamic_zero_return_code(self):
+        proc = FakeProcess(0)
+        rcs = output.ReturnCodeToSubunit(io.BytesIO(), worker=proc, dynamic=True)
+        out = rcs.read()
+        self.assertEqual(b"", out)
+        tests = _parse_output(out)
+        self.assertEqual([], tests)
+
+    def test_dynamic_zero_return_code_after_output(self):
+        # A worker that exited cleanly after emitting output must not get
+        # a synthetic test appended.
+        proc = FakeProcess(0)
+        rcs = output.ReturnCodeToSubunit(
+            io.BytesIO(b"some worker output\n"), worker=proc, dynamic=True
+        )
+        self.assertEqual(b"some worker output\n", rcs.read())
+        self.assertEqual(b"", rcs.read())
+
+    def test_popen_return_code_after_output(self):
+        popen = FakePopen(io.BytesIO(b"some runner output\n"), 1)
+        rcs = output.ReturnCodeToSubunit(popen)
+        self.assertEqual(b"some runner output\n", rcs.read())
+        tests = _parse_output(rcs.read())
+        self.assertIn(
+            ("process-returncode", "fail"),
+            [(test["id"], test["status"]) for test in tests],
+        )
+
+    def test_del_without_proc(self):
+        # The dynamic mode builds the wrapper before the thread/process is
+        # known; deleting such an object must not raise.
+        rcs = output.ReturnCodeToSubunit(io.BytesIO(), worker=None, dynamic=True)
+        self.assertIsNone(rcs.__del__())
