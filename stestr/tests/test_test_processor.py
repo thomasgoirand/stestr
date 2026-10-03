@@ -116,7 +116,7 @@ class TestDynamicWorker(base.TestCase):
 
     def test_dynamic_worker_runs_queued_tests(self):
         job_queue = queue.Queue()
-        job_queue.put(self._test_id)
+        job_queue.put([self._test_id])
         job_queue.put(None)
         out = self._run_worker(job_queue)
         tests = _parse_subunit_output(out)

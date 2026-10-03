@@ -225,8 +225,10 @@ class TestScheduler(base.TestCase):
         dynamic_test_list = scheduler.get_dynamic_test_list(test_ids, repo)
         # The groups with known durations are scheduled first from the
         # slowest to the fastest, the groups with unknown time come last.
+        # Without a group_callback every test id is its own group.
         self.assertEqual(
-            ["slow", "fast1", "fast2", "unknown1", "unknown2"], dynamic_test_list
+            [["slow"], ["fast1"], ["fast2"], ["unknown1"], ["unknown2"]],
+            dynamic_test_list,
         )
 
     def test_get_dynamic_test_list_randomize(self):
@@ -235,10 +237,11 @@ class TestScheduler(base.TestCase):
         dynamic_test_list = scheduler.get_dynamic_test_list(
             test_ids, repo, randomize=True
         )
-        # randomize=True must return a list of the test ids (and not the
-        # None returned by random.shuffle)
+        # randomize=True must return a list of single test groups (and not
+        # the None returned by random.shuffle)
         self.assertIsInstance(dynamic_test_list, list)
-        self.assertEqual(sorted(test_ids), sorted(dynamic_test_list))
+        flattened = [test_id for group in dynamic_test_list for test_id in group]
+        self.assertEqual(sorted(test_ids), sorted(flattened))
 
     def test_get_dynamic_test_list_with_grouping(self):
         test_ids = [
@@ -253,8 +256,17 @@ class TestScheduler(base.TestCase):
         dynamic_test_list = scheduler.get_dynamic_test_list(
             test_ids, None, group_callback
         )
-        # The ids scheduled for the workers must be the full test ids of
-        # each group, not the group ids themselves.
-        self.assertEqual(sorted(test_ids), sorted(dynamic_test_list))
-        for test_id in dynamic_test_list:
-            self.assertFalse(test_id.endswith("."))
+        # The scheduled groups must contain the full test ids of each
+        # group, not the group ids themselves, and all the tests of a
+        # group are scheduled together as a single unit of work.
+        self.assertEqual(
+            [
+                ["tests.test_a.FakeTestClass.test_one",
+                 "tests.test_a.FakeTestClass.test_two"],
+                ["tests.test_b.FakeTestClass.test_one"],
+            ],
+            sorted(dynamic_test_list),
+        )
+        for group in dynamic_test_list:
+            for test_id in group:
+                self.assertFalse(test_id.endswith("."))

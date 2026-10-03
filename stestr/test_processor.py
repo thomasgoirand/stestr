@@ -32,19 +32,19 @@ from stestr import testlist
 
 
 def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
-    """Run test ids from a queue until the sentinel is received.
+    """Run the groups of test ids from a queue until the sentinel.
 
     This is the target function used by the worker processes spawned for
-    dynamic scheduling. Each worker pulls a single test id at a time from
-    the shared queue and runs it, writing the subunit output to the write
-    end of a pipe that is read by the parent process. After the test list
-    the parent enqueues a None sentinel per worker, and a worker exits as
-    soon as it receives one. This guarantees a worker only exits after
-    every test id was handed to some worker, without any race on an
+    dynamic scheduling. Each worker pulls a single group of test ids at a
+    time from the shared queue and runs it, writing the subunit output to
+    the write end of a pipe that is read by the parent process. After the
+    groups the parent enqueues a None sentinel per worker, and a worker
+    exits as soon as it receives one. This guarantees a worker only exits
+    after every group was handed to some worker, without any race on an
     empty() check between workers.
 
-    :param job_queue: The queue with the test ids to run, shared by all
-        the workers of a run.
+    :param job_queue: The queue with the groups of test ids to run, shared
+        by all the workers of a run.
     :param subunit_pipe: The write end of the pipe used to send the
         subunit output of the tests back to the parent process.
     :param test_path: The path of the test tree. When set, the worker
@@ -95,16 +95,24 @@ def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
             for test in program.iterate_tests(discovered):
                 test_map[test.id()] = test
         while True:
-            test_id = job_queue.get()
-            if test_id is None:
+            group = job_queue.get()
+            if group is None:
                 break
             if test_path:
-                test = test_map.get(test_id)
-                if test is None:
+                tests = [
+                    test_map[test_id] for test_id in group if test_id in test_map
+                ]
+                if not tests:
                     continue
             else:
-                test = unittest.defaultTestLoader.loadTestsFromName(test_id)
-            run.SubunitTestRunner(stdout=sys.stdout).run(test)
+                tests = [
+                    unittest.defaultTestLoader.loadTestsFromName(test_id)
+                    for test_id in group
+                ]
+            # Run the group as a single suite, so that the class level
+            # fixtures are handled by the suite like in the non-dynamic
+            # mode.
+            run.SubunitTestRunner(stdout=sys.stdout).run(unittest.TestSuite(tests))
     finally:
         sys.stdout.flush()
         subunit_stream.close()
@@ -415,8 +423,8 @@ class TestProcessorFixture(fixtures.Fixture):
             # FileNotFoundError when rebuilding the queue.
             self._test_list_queue = context.Queue()
 
-            for test_id in test_id_list:
-                self._test_list_queue.put(test_id)
+            for group in test_id_list:
+                self._test_list_queue.put(group)
             # Enqueue a sentinel per worker. A worker exits when it receives
             # a sentinel, so every worker exits only after all the test ids
             # were handed to a worker.

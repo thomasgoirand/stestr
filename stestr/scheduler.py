@@ -24,13 +24,35 @@ from stestr import selection
 def get_dynamic_test_list(
     test_ids, repository=None, group_callback=None, randomize=False
 ):
-    dynamic_test_list = []
+    """Group the test ids for the dynamic scheduler.
+
+    The ids are returned as a list of groups of test ids, sorted from the
+    slowest to the fastest estimated group. Each group is the unit of work
+    a dynamic scheduler worker picks from the queue: with a group_callback
+    (or a group_regex config) a group is what the non-dynamic scheduler
+    keeps on a single worker, e.g. a test class, so that the class level
+    fixtures are only run once per worker like in the non-dynamic mode.
+
+    :param list test_ids: The list of test_ids to be scheduled
+    :param repository: A repository object used for looking up the timing
+        data of the tests. Optional.
+    :param group_callback: A callback function that is used as a scheduler
+        hint to group test_ids together and treat them as a single unit for
+        scheduling. This function expects a single test_id parameter and it
+        will return a group identifier. Tests_ids that have the same group
+        identifier will be kept together on a worker. Optional.
+    :param bool randomize: If true the order of the groups is randomized
+
+    :return: A list where each element is a distinct list of test_ids
+        (a group), and the union of all the elements is equal to
+        set(test_ids).
+    """
     _group_callback = group_callback
     time_data = {}
     if randomize:
         test_ids = list(test_ids)
         random.shuffle(test_ids)
-        return test_ids
+        return [[test_id] for test_id in test_ids]
     if repository:
         time_data = repository.get_test_times(test_ids)
         timed_tests = time_data["known"]
@@ -80,15 +102,17 @@ def get_dynamic_test_list(
     # sort the groups by time
     # allocate to partitions by putting each group in to the partition with
     # the current (lowest time, shortest length[in tests])
+    dynamic_test_list = []
+
     def consume_queue(groups):
         queue = sorted(groups.items(), key=operator.itemgetter(1), reverse=True)
         for group_id, _duration in queue:
-            dynamic_test_list.extend(group_ids[group_id])
+            dynamic_test_list.append(group_ids[group_id])
 
     consume_queue(timed)
     consume_queue(partial)
     for group_id in unknown:
-        dynamic_test_list.extend(group_ids[group_id])
+        dynamic_test_list.append(group_ids[group_id])
 
     return dynamic_test_list
 
