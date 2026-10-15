@@ -10,6 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import faulthandler
 import io
 import multiprocessing
 import os
@@ -18,10 +19,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 import fixtures
+from subunit.test_results import AutoTimingTestResultDecorator
 from subunit import v2
+from testtools import ExtendedToStreamDecorator
 
 from stestr import results
 from stestr import scheduler
@@ -48,7 +53,220 @@ def _emit_subunit_failure(stream, test_id, message):
     )
 
 
-def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
+_DEBUG_WATCHDOG_INTERVAL = 30
+# Seconds the watchdog waits after signaling a worker before signaling
+# the next one, so that their stack dumps do not interleave in the
+# shared debug stream.
+_DEBUG_WATCHDOG_DUMP_DELAY = 1
+# The subunit test statuses that mark the end of a test. See the
+# status_mask of subunit.v2.StreamResultToBytes.
+_FINAL_TEST_STATUSES = frozenset(["success", "fail", "skip", "xfail", "uxsuccess"])
+
+
+class _DebugStreamResult:
+    """StreamResult wrapper logging the per-test progress of a worker.
+
+    It is inserted at the innermost level of the result chain built by
+    _DebugSubunitTestRunner: everything is forwarded unchanged to the
+    wrapped stream, and a line is written to the debug stream when a
+    test starts (status in-progress) and when it reaches a final status,
+    so that the state of each worker stays visible while it runs, even
+    when a test never completes.
+    """
+
+    def __init__(self, result, debug_stream, worker_name):
+        self._result = result
+        self._debug_stream = debug_stream
+        self._worker_name = worker_name
+        self._start_times = {}
+
+    def status(
+        self,
+        test_id=None,
+        test_status=None,
+        test_tags=None,
+        runnable=True,
+        file_name=None,
+        file_bytes=None,
+        eof=False,
+        mime_type=None,
+        route_code=None,
+        timestamp=None,
+    ):
+        if test_status == "inprogress":
+            self._start_times[test_id] = time.monotonic()
+            self._write("[stestr-dbg] %s START %s\n" % (self._worker_name, test_id))
+        elif test_status in _FINAL_TEST_STATUSES and test_id in self._start_times:
+            duration = time.monotonic() - self._start_times.pop(test_id)
+            self._write(
+                "[stestr-dbg] %s DONE %s (%.2fs)\n"
+                % (self._worker_name, test_id, duration)
+            )
+        self._result.status(
+            test_id=test_id,
+            test_status=test_status,
+            test_tags=test_tags,
+            runnable=runnable,
+            file_name=file_name,
+            file_bytes=file_bytes,
+            eof=eof,
+            mime_type=mime_type,
+            route_code=route_code,
+            timestamp=timestamp,
+        )
+
+    def _write(self, line):
+        self._debug_stream.write(line)
+        self._debug_stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._result, name)
+
+
+class _DebugSubunitTestRunner(run.SubunitTestRunner):
+    """A SubunitTestRunner that logs per-test progress to a debug stream.
+
+    Otherwise identical to SubunitTestRunner: the subunit stream of the
+    tests is built exactly the same way, the debug lines are written to
+    a separate stream (the worker's stderr in real runs).
+    """
+
+    def __init__(
+        self,
+        failfast=False,
+        tb_locals=False,
+        stdout=sys.stdout,
+        debug_stream=None,
+        worker_name=None,
+    ):
+        super().__init__(failfast=failfast, tb_locals=tb_locals, stdout=stdout)
+        self._debug_stream = debug_stream if debug_stream is not None else sys.stderr
+        self._worker_name = worker_name
+
+    def run(self, test):
+        "Run the given test case or test suite."
+        result, _ = self._list(test)
+        result = _DebugStreamResult(result, self._debug_stream, self._worker_name)
+        result = ExtendedToStreamDecorator(result)
+        result = AutoTimingTestResultDecorator(result)
+        if self.failfast is not None:
+            result.failfast = self.failfast
+            result.tb_locals = self.tb_locals
+        result.startTestRun()
+        try:
+            test(result)
+        finally:
+            result.stopTestRun()
+        return result
+
+
+def _dynamic_debug_watchdog(
+    workers,
+    groups_done,
+    total_groups,
+    interval=_DEBUG_WATCHDOG_INTERVAL,
+    debug_stream=None,
+    stop_event=None,
+):
+    """Report the state of a dynamic scheduler run until it ends.
+
+    Started as a daemon thread by the dynamic scheduling mode of
+    TestProcessorFixture.run_tests() when debugging is enabled. Every
+    interval seconds it writes to the debug stream how many groups of
+    tests were completed, how many are still pending and how many
+    workers are still alive. When no group finished across two
+    consecutive ticks, the still-alive workers are signaled one at a
+    time with SIGUSR1 and each of them dumps its Python stack (see
+    _dynamic_worker), so that a hung test can be located in the log.
+    The dumps of concurrently signaled workers would interleave into
+    an unreadable mix in the shared debug stream, so a worker is only
+    signaled once the previous dump had the time to land.
+    The thread returns as soon as every worker exited.
+
+    :param workers: The list of worker dicts built by run_tests(), each
+        carrying the worker process under the "proc" key.
+    :param groups_done: A multiprocessing.Value incremented by each
+        worker after every completed group of tests.
+    :param int total_groups: The number of groups scheduled for the run.
+    :param int interval: Seconds between two reports.
+    :param debug_stream: The stream the reports are written to, defaults
+        to sys.stderr.
+    :param stop_event: A threading.Event set by the fixture cleanup to
+        stop the watchdog promptly once the run ended.
+    """
+    if debug_stream is None:
+        debug_stream = sys.stderr
+    last_done = -1
+    stalled_ticks = 0
+    last_progress_time = time.monotonic()
+    while True:
+        if stop_event is not None:
+            if stop_event.wait(interval):
+                return
+        else:
+            time.sleep(interval)
+        alive = []
+        dead = []
+        for w in workers:
+            if w["proc"].is_alive():
+                alive.append(w)
+            else:
+                dead.append(w)
+        done = groups_done.value
+        debug_stream.write(
+            "[stestr-dbg] watchdog: groups done %s/%s, pending %s, "
+            "workers alive %s/%s\n"
+            % (
+                done,
+                total_groups,
+                total_groups - done,
+                len(alive),
+                len(workers),
+            )
+        )
+        if dead:
+            debug_stream.write(
+                "[stestr-dbg] watchdog: exited workers: %s\n"
+                % ", ".join(
+                    "%s (exitcode %s)" % (w["proc"].name, w["proc"].exitcode)
+                    for w in dead
+                )
+            )
+        if not alive:
+            debug_stream.write("[stestr-dbg] watchdog: all workers exited\n")
+            debug_stream.flush()
+            return
+        if done == last_done:
+            stalled_ticks += 1
+            if stalled_ticks >= 2:
+                debug_stream.write(
+                    "[stestr-dbg] watchdog: no group finished in %ss\n"
+                    % int(time.monotonic() - last_progress_time)
+                )
+                debug_stream.flush()
+                # Signal one worker at a time: every worker dumps its
+                # stack into the same debug stream, so the dumps of
+                # concurrently signaled workers would interleave. The
+                # header names the worker, and the next worker is only
+                # signaled once the previous dump had the time to land.
+                for i, w in enumerate(alive):
+                    if i:
+                        time.sleep(_DEBUG_WATCHDOG_DUMP_DELAY)
+                    debug_stream.write(
+                        "[stestr-dbg] watchdog: dumping stacks of %s\n" % w["proc"].name
+                    )
+                    debug_stream.flush()
+                    try:
+                        os.kill(w["proc"].pid, signal.SIGUSR1)
+                    except OSError:
+                        pass
+        else:
+            stalled_ticks = 0
+            last_progress_time = time.monotonic()
+        last_done = done
+        debug_stream.flush()
+
+
     """Run the groups of test ids from a queue until the sentinel.
 
     This is the target function used by the worker processes spawned for
@@ -70,11 +288,22 @@ def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
         discovered tests matched by id. Optional.
     :param top_dir: The top level directory used by that discovery.
         Optional.
+    :param bool debug: Log the progress of the worker to the debug
+        stream: the groups picked from the queue and each test start
+        (START) and completion (DONE), and dump the stack of the worker
+        to the debug stream whenever it receives SIGUSR1 (sent by the
+        watchdog of the parent process, see _dynamic_debug_watchdog).
+    :param debug_stream: The stream the debug output is written to,
+        defaults to sys.stderr. Only used when debug is true.
+    :param groups_done: A multiprocessing.Value shared with the parent
+        process, incremented after every completed group of tests.
+        Optional.
     """
     # NOTE(mtreinish): Duplicate the file descriptor of the pipe so the
     # writer is decoupled from the Connection object's lifetime. Without
     # this you'll be fighting random bad file descriptor errors.
     subunit_stream = os.fdopen(os.dup(subunit_pipe.fileno()), "wb")
+    parent_stdout = sys.stdout
     # The non-dynamic mode loads the test ids from a subprocess started
     # with python -m which puts the current working directory on sys.path.
     # Do the same here so the tests of the project under test are
@@ -96,6 +325,16 @@ def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
     # worker, like the subprocess runner binds its stream once.
     stdout_wrapper = io.TextIOWrapper(subunit_stream)
     sys.stdout = stdout_wrapper
+    if debug:
+        if debug_stream is None:
+            debug_stream = sys.stderr
+        # NOTE: The dump handler replaces any handler registered before
+        # (e.g. by the code of the project under test at discovery time)
+        # and does not chain to it: the worker must keep running after a
+        # dump, since a slow test must not be killed by it.
+        faulthandler.register(signal.SIGUSR1, file=debug_stream, all_threads=True)
+        worker_name = multiprocessing.current_process().name
+        picked_groups = 0
     try:
         test_map = {}
         if test_path:
@@ -131,6 +370,13 @@ def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
             group = job_queue.get()
             if group is None:
                 break
+            if debug:
+                picked_groups += 1
+                debug_stream.write(
+                    "[stestr-dbg] %s picked group #%s (%s tests)\n"
+                    % (worker_name, picked_groups, len(group))
+                )
+                debug_stream.flush()
             if test_path:
                 tests = []
                 for test_id in group:
@@ -150,6 +396,12 @@ def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
                             "the worker interpreter." % test_id,
                         )
                 if not tests:
+                    # The whole group was filtered out: count it as done
+                    # anyway so that the accounting of the parent stays
+                    # right.
+                    if groups_done is not None:
+                        with groups_done.get_lock():
+                            groups_done.value += 1
                     continue
             else:
                 tests = [
@@ -159,13 +411,25 @@ def _dynamic_worker(job_queue, subunit_pipe, test_path=None, top_dir=None):
             # Run the group as a single suite, so that the class level
             # fixtures are handled by the suite like in the non-dynamic
             # mode.
-            run.SubunitTestRunner(stdout=stdout_wrapper).run(unittest.TestSuite(tests))
+            if debug:
+                runner = _DebugSubunitTestRunner(
+                    stdout=stdout_wrapper,
+                    debug_stream=debug_stream,
+                    worker_name=worker_name,
+                )
+            else:
+                runner = run.SubunitTestRunner(stdout=stdout_wrapper)
+            runner.run(unittest.TestSuite(tests))
+            if groups_done is not None:
+                with groups_done.get_lock():
+                    groups_done.value += 1
     finally:
         # Flush the wrapper, not sys.stdout: a test may have left a
         # replaced sys.stdout behind, and it must not break the flush of
         # the results at exit.
         stdout_wrapper.flush()
         subunit_stream.close()
+        sys.stdout = parent_stdout
 
 
 class TestProcessorFixture(fixtures.Fixture):
@@ -218,6 +482,11 @@ class TestProcessorFixture(fixtures.Fixture):
     :param bool dynamic: Use the experimental dynamic scheduler, workers
         will ask for the next test to run instead of being assigned a
         partition up front
+    :param bool dynamic_debug: Enable the debug output of the dynamic
+        scheduler (see the --dynamic-debug option of stestr run): each
+        worker logs its progress to stderr and a watchdog thread
+        reports the state of the run until it ends. Only used when
+        dynamic is true.
     :param str test_path: The path of the test tree, used by the dynamic
         scheduler to run a full discovery in each worker, mirroring the
         non-dynamic runner subprocesses. Optional.
@@ -244,6 +513,7 @@ class TestProcessorFixture(fixtures.Fixture):
         include_list=None,
         randomize=False,
         dynamic=False,
+        dynamic_debug=False,
         test_path=None,
         top_dir=None,
     ):
@@ -268,6 +538,8 @@ class TestProcessorFixture(fixtures.Fixture):
         self.exclude_regex = exclude_regex
         self.randomize = randomize
         self.dynamic = dynamic
+        self.dynamic_debug = dynamic_debug
+        self._debug_stop = None
         self.test_path = test_path
         self.top_dir = top_dir
 
@@ -534,6 +806,9 @@ class TestProcessorFixture(fixtures.Fixture):
             # SEM_VALUE_MAX, which is 32767 on macOS, so a run with more
             # groups than that would deadlock in put() with no consumer
             # to drain them. The workers pull the groups as they are fed.
+            groups_done = None
+            if self.dynamic_debug:
+                groups_done = context.Value("i", 0)
             # One worker per group at most: every worker runs a full
             # discovery of the test tree first, so spawning more workers
             # than groups would import the tree for nothing.
@@ -548,6 +823,9 @@ class TestProcessorFixture(fixtures.Fixture):
                         fd_pipe_w,
                         self.test_path,
                         self.top_dir,
+                        self.dynamic_debug,
+                        None,
+                        groups_done,
                     ),
                 )
                 proc.start()
@@ -570,4 +848,17 @@ class TestProcessorFixture(fixtures.Fixture):
             # were handed to a worker.
             for _ in range(num_workers):
                 self._test_list_queue.put(None)
+            if self.dynamic_debug:
+                self._debug_stop = threading.Event()
+                # Stop the watchdog as soon as the fixture is cleaned up,
+                # so that it does not report one last time long after the
+                # end of the run.
+                self.addCleanup(self._debug_stop.set)
+                threading.Thread(
+                    target=_dynamic_debug_watchdog,
+                    args=(result, groups_done, len(test_id_list)),
+                    kwargs={"stop_event": self._debug_stop},
+                    name="stestr-dynamic-debug-watchdog",
+                    daemon=True,
+                ).start()
             return result
