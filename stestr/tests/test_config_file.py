@@ -75,6 +75,8 @@ class TestTestrConf(base.TestCase):
             exclude_list=None,
             concurrency=0,
             dynamic=False,
+            dynamic_progress=False,
+            dynamic_progress_rate_limit=False,
             dynamic_debug=False,
             group_callback=expected_group_callback,
             test_filters=None,

@@ -479,6 +479,45 @@ class TestReturnCodes(base.TestCase):
         )
 
     @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
+    def test_dynamic_progress_display(self):
+        # The progress display is opt-in with --dynamic-progress, and
+        # each worker displays a line before running its next group of
+        # tests.
+        out, err = self.assertRunExit(
+            "stestr run --dynamic --dynamic-progress --concurrency 2 passing", 0
+        )
+        self.assertRegex(
+            err.decode(),
+            r"\[\d+/\d+ \(\d+\.\d%\) elapsed: \d+:\d+:\d+, "
+            r"ETA: (~\d+:\d+:\d+|unknown)\]",
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
+    def test_dynamic_progress_rate_limited(self):
+        # The optional rate limit collapses the display to at most one
+        # line per percentage step of the run.
+        out, err = self.assertRunExit(
+            "stestr run --dynamic --dynamic-progress-rate-limit"
+            " --concurrency 2 passing",
+            0,
+        )
+        self.assertRegex(
+            err.decode(),
+            r"\[\d+/\d+ \(\d+\.\d%\) elapsed: \d+:\d+:\d+, "
+            r"ETA: (~\d+:\d+:\d+|unknown)\]",
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
+    def test_dynamic_progress_disabled_by_default(self):
+        # Without --dynamic-progress no progress line is displayed. The
+        # stderr may still carry unrelated output (e.g. the experimental
+        # scheduler warning, or the multiprocessing resource tracker of
+        # the interpreter), so only the progress line pattern is
+        # asserted against.
+        out, err = self.assertRunExit("stestr run --dynamic --concurrency 2 passing", 0)
+        self.assertNotRegex(err.decode(), r"\[\d+/\d+ \(\d+\.\d%\) elapsed:")
+
+    @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
     def test_dynamic_subunit_passing(self):
         self.assertRunExit(
             "stestr run --dynamic --concurrency 2 passing --subunit",

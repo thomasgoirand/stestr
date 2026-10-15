@@ -127,6 +127,8 @@ class TestrConf:
         randomize=False,
         parallel_class=None,
         dynamic=False,
+        dynamic_progress=False,
+        dynamic_progress_rate_limit=False,
         dynamic_debug=False,
     ):
         """Get a test_processor.TestProcessorFixture for this config file
@@ -174,6 +176,15 @@ class TestrConf:
             config file option which includes `group-regex` are set, this value
             will be used.
         :param bool dynamic: Enable dynamic scheduling
+        :param bool dynamic_progress: Display the completion of a dynamic
+            run (tests done, percentage, elapsed time and a rough ETA) on
+            stderr before running each next group of tests. Only used
+            when dynamic is true.
+        :param bool dynamic_progress_rate_limit: Rate limit the dynamic
+            run progress display to at most one line per percentage step
+            of the run across all the workers, instead of one line per
+            group. Implies dynamic_progress. Only used when dynamic is
+            true.
         :param bool dynamic_debug: Enable the debug output of the
             dynamic scheduler. Only used when dynamic is true.
 
@@ -257,6 +268,8 @@ class TestrConf:
             include_list=include_list,
             randomize=randomize,
             dynamic=dynamic,
+            dynamic_progress=dynamic_progress,
+            dynamic_progress_rate_limit=dynamic_progress_rate_limit,
             dynamic_debug=dynamic_debug,
             test_path=test_path,
             top_dir=top_dir,

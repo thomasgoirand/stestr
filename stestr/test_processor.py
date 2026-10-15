@@ -63,6 +63,51 @@ _DEBUG_WATCHDOG_DUMP_DELAY = 1
 _FINAL_TEST_STATUSES = frozenset(["success", "fail", "skip", "xfail", "uxsuccess"])
 
 
+def _format_progress_duration(seconds):
+    """Format a duration in seconds as a HH:MM:SS string."""
+    seconds = max(int(seconds), 0)
+    return "%02d:%02d:%02d" % (
+        seconds // 3600,
+        seconds % 3600 // 60,
+        seconds % 60,
+    )
+
+
+def _format_dynamic_progress(tests_done, total_tests, elapsed_seconds):
+    """Build the progress line displayed by the dynamic scheduler workers.
+
+    Each worker writes the line right before running its next group of
+    tests: it shows how many of the tests of the whole run already
+    completed, the corresponding percentage, the elapsed time of the run
+    and a rough ETA extrapolating the average duration of the completed
+    tests to the remaining ones. The ETA is unknown until the first group
+    of tests completes.
+
+    :param int tests_done: The number of tests already completed by the
+        run.
+    :param int total_tests: The total number of tests of the run.
+    :param float elapsed_seconds: Seconds elapsed since the run started.
+    :return: The progress line, without a trailing newline.
+    """
+    tests_done = max(min(tests_done, total_tests), 0)
+    percent = 100.0 * tests_done / total_tests if total_tests else 100.0
+    if tests_done >= total_tests > 0:
+        eta = "~00:00:00"
+    elif tests_done > 0:
+        eta = "~%s" % _format_progress_duration(
+            elapsed_seconds / tests_done * (total_tests - tests_done)
+        )
+    else:
+        eta = "unknown"
+    return "[%d/%d (%.1f%%) elapsed: %s, ETA: %s]" % (
+        tests_done,
+        total_tests,
+        percent,
+        _format_progress_duration(elapsed_seconds),
+        eta,
+    )
+
+
 class _DebugStreamResult:
     """StreamResult wrapper logging the per-test progress of a worker.
 
@@ -267,6 +312,20 @@ def _dynamic_debug_watchdog(
         debug_stream.flush()
 
 
+def _dynamic_worker(
+    job_queue,
+    subunit_pipe,
+    test_path=None,
+    top_dir=None,
+    debug=False,
+    debug_stream=None,
+    groups_done=None,
+    tests_done=None,
+    run_start=None,
+    total_tests=0,
+    progress=False,
+    last_percent=None,
+):
     """Run the groups of test ids from a queue until the sentinel.
 
     This is the target function used by the worker processes spawned for
@@ -298,6 +357,25 @@ def _dynamic_debug_watchdog(
     :param groups_done: A multiprocessing.Value shared with the parent
         process, incremented after every completed group of tests.
         Optional.
+    :param tests_done: A multiprocessing.Value shared with the parent
+        process, incremented with the size of every completed group of
+        tests. Optional.
+    :param run_start: A multiprocessing.Value shared with the parent
+        process, set by the parent to the time.time() at which the run
+        started. Used with tests_done to display the progress of the
+        run. Optional.
+    :param int total_tests: The total number of tests scheduled for the
+        run, used with tests_done to display the progress of the run.
+    :param bool progress: Display the progress of the run on stderr
+        before running each next group of tests. Off by default: the
+        display is opt-in with the --dynamic-progress option of
+        stestr run.
+    :param last_percent: A multiprocessing.Value shared with the other
+        workers of the run, holding the last percentage step that was
+        displayed. A progress line is only displayed when the percentage
+        advances, so that at most one line is written per percentage
+        step across all the workers. Optional: without it every progress
+        line is displayed.
     """
     # NOTE(mtreinish): Duplicate the file descriptor of the pipe so the
     # writer is decoupled from the Connection object's lifetime. Without
@@ -366,10 +444,50 @@ def _dynamic_debug_watchdog(
                     "\n".join(loader.errors),
                 )
 
+        def _count_tests_done(count):
+            # Add the size of a completed group to the shared counter of
+            # the run. Returns True when the whole run is completed, so
+            # that the caller displays the final progress line.
+            if tests_done is None or not total_tests:
+                return False
+            with tests_done.get_lock():
+                tests_done.value += count
+                return tests_done.value >= total_tests
+
+        def _write_progress_line(tests_done_value):
+            if not progress:
+                return
+            if last_percent is not None:
+                # The workers share the last printed percentage: a line
+                # is only displayed when the percentage advances, so a
+                # run without a group regex does not print one line per
+                # test.
+                percent = (
+                    int(100 * min(tests_done_value, total_tests) / total_tests)
+                    if total_tests
+                    else 100
+                )
+                with last_percent.get_lock():
+                    if percent <= last_percent.value:
+                        return
+                    last_percent.value = percent
+            elapsed = max(time.time() - run_start.value, 0.0)
+            sys.stderr.write(
+                "%s\n"
+                % _format_dynamic_progress(tests_done_value, total_tests, elapsed)
+            )
+            sys.stderr.flush()
+
         while True:
             group = job_queue.get()
             if group is None:
                 break
+            # Display the completion of the run on stderr before running
+            # the next group of tests.
+            if tests_done is not None and run_start is not None and total_tests:
+                with tests_done.get_lock():
+                    done = tests_done.value
+                _write_progress_line(done)
             if debug:
                 picked_groups += 1
                 debug_stream.write(
@@ -402,6 +520,8 @@ def _dynamic_debug_watchdog(
                     if groups_done is not None:
                         with groups_done.get_lock():
                             groups_done.value += 1
+                    if _count_tests_done(len(group)):
+                        _write_progress_line(tests_done.value)
                     continue
             else:
                 tests = [
@@ -423,6 +543,8 @@ def _dynamic_debug_watchdog(
             if groups_done is not None:
                 with groups_done.get_lock():
                     groups_done.value += 1
+            if _count_tests_done(len(group)):
+                _write_progress_line(tests_done.value)
     finally:
         # Flush the wrapper, not sys.stdout: a test may have left a
         # replaced sys.stdout behind, and it must not break the flush of
@@ -481,7 +603,16 @@ class TestProcessorFixture(fixtures.Fixture):
         partitioned into separate workers
     :param bool dynamic: Use the experimental dynamic scheduler, workers
         will ask for the next test to run instead of being assigned a
-        partition up front
+        partition up front.
+    :param bool dynamic_progress: Display the completion of a dynamic
+        run (tests done, percentage, elapsed time and a rough ETA) on
+        stderr before running each next group of tests. Off by default:
+        the display is opt-in. Only used when dynamic is true.
+    :param bool dynamic_progress_rate_limit: Rate limit the dynamic run
+        progress display to at most one line per percentage step of the
+        run across all the workers, instead of one line per group. The
+        workers share the last displayed percentage to that end. Implies
+        dynamic_progress. Only used when dynamic is true.
     :param bool dynamic_debug: Enable the debug output of the dynamic
         scheduler (see the --dynamic-debug option of stestr run): each
         worker logs its progress to stderr and a watchdog thread
@@ -513,6 +644,8 @@ class TestProcessorFixture(fixtures.Fixture):
         include_list=None,
         randomize=False,
         dynamic=False,
+        dynamic_progress=False,
+        dynamic_progress_rate_limit=False,
         dynamic_debug=False,
         test_path=None,
         top_dir=None,
@@ -538,6 +671,8 @@ class TestProcessorFixture(fixtures.Fixture):
         self.exclude_regex = exclude_regex
         self.randomize = randomize
         self.dynamic = dynamic
+        self.dynamic_progress = dynamic_progress or dynamic_progress_rate_limit
+        self.dynamic_progress_rate_limit = dynamic_progress_rate_limit
         self.dynamic_debug = dynamic_debug
         self._debug_stop = None
         self.test_path = test_path
@@ -809,6 +944,28 @@ class TestProcessorFixture(fixtures.Fixture):
             groups_done = None
             if self.dynamic_debug:
                 groups_done = context.Value("i", 0)
+            # The progress display counts completed tests in a shared
+            # counter, and reads the start time of the run from a shared
+            # value set by the parent before spawning the workers. Both
+            # are scoped to the instance like the queue above: if they
+            # were garbage collected while the workers are still
+            # starting, the finalizer of their locks would unlink the
+            # underlying semaphores and the workers would crash with a
+            # FileNotFoundError when rebuilding them.
+            tests_done = context.Value("i", 0)
+            run_start = context.Value("d", time.time())
+            total_tests = sum(len(group) for group in test_id_list)
+            # With the rate limited display, the workers share the last
+            # printed percentage, so that at most one line is displayed
+            # per percentage step across all the workers. Scoped to the
+            # instance like the other shared values above.
+            last_percent = None
+            if self.dynamic_progress_rate_limit:
+                last_percent = context.Value("i", -1)
+                self._last_percent = last_percent
+            self._tests_done = tests_done
+            self._run_start = run_start
+            self._total_tests = total_tests
             # One worker per group at most: every worker runs a full
             # discovery of the test tree first, so spawning more workers
             # than groups would import the tree for nothing.
@@ -826,6 +983,11 @@ class TestProcessorFixture(fixtures.Fixture):
                         self.dynamic_debug,
                         None,
                         groups_done,
+                        tests_done,
+                        run_start,
+                        total_tests,
+                        self.dynamic_progress,
+                        last_percent,
                     ),
                 )
                 proc.start()
