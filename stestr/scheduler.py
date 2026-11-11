@@ -119,16 +119,15 @@ def get_dynamic_test_list(
         scheduling. This function expects a single test_id parameter and it
         will return a group identifier. Tests_ids that have the same group
         identifier will be kept together on a worker. Optional.
-    :param bool randomize: If true the order of the groups is randomized
+    :param bool randomize: If true the order in which the groups are
+        picked from the queue is randomized, as well as the order of
+        the tests inside each group; the grouping itself is preserved
+        and the timing based ordering is skipped.
 
     :return: A list where each element is a distinct list of test_ids
         (a group), and the union of all the elements is equal to
         set(test_ids).
     """
-    if randomize:
-        test_ids = list(test_ids)
-        random.shuffle(test_ids)
-        return [[test_id] for test_id in test_ids]
     # The ids are sorted first: the caller may hand a set of test ids
     # (the test selection returns one), and iterating a set yields a
     # hash order that changes on every run. The worker runs the tests of
@@ -136,6 +135,16 @@ def get_dynamic_test_list(
     # deterministic run order, the same discovery order the non-dynamic
     # runner keeps.
     group_ids = _group_test_ids(sorted(test_ids), group_callback)
+    if randomize:
+        # Randomize the order in which the groups are picked from the
+        # queue, and the order of the tests inside each group, keeping
+        # the grouping itself as the unit of work. The timing data
+        # based ordering is skipped: the pick-up order is random.
+        group_list = list(group_ids.values())
+        random.shuffle(group_list)
+        for group in group_list:
+            random.shuffle(group)
+        return group_list
     timed_tests, unknown_tests = _load_time_data(test_ids, repository)
     timed, partial, unknown = _time_groups(group_ids, timed_tests, unknown_tests)
     # The workers pull the groups from the queue, so the scheduling only
