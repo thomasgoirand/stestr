@@ -519,29 +519,41 @@ from the queue is randomized, as well as the order of the tests inside
 each group, instead of using the timing data based ordering. The
 grouping itself is preserved, so a group (e.g. a test class with a
 ``group_regex`` config or ``parallel-class``) keeps its tests together
-on the worker that picked it.
+on the worker that picked it. The option also works with the classic
+scheduler: the shuffled list of tests is fed to the runner, which runs
+them in the order of the list.
 
 You can enable this new scheduler with the ``--dynamic`` flag to
 ``stestr run``. This option should also be compatible with the grouping
 options described in the :ref:`group_regex` section. Using the two in
 combination will result in the scheduler working with the group of tests
-instead of individual tests.
+instead of individual tests. Options the dynamic scheduler cannot honor
+(``--serial``, ``--isolated``, ``--analyze-isolation``, ``--no-discover``,
+``--pdb`` and ``--worker-file``) are rejected instead of being silently
+ignored. A concurrency of 1 degenerates to the classic serial runner.
 
 While a dynamic run is in progress, and with the ``--dynamic-progress``
-option, each worker displays the completion of the whole run on stderr
-right before running its next group of tests::
+option, every test line of the run output is annotated with the progress
+of the run: the number of tests already completed (the test on the line
+included), the corresponding percentage, the time elapsed since the
+first test started and a rough ETA extrapolating the average duration
+of the completed tests to the remaining ones::
 
-    [42/312 (13.5%) elapsed: 00:01:23, ETA: ~00:08:53]
+    {3} [ 42/312 (13.5%) Time: 00:00:33, ETA: ~00:08:53] mypackage.tests.test_foo [0.012s] ... ok
 
-The display is off by default. With the optional
-``--dynamic-progress-rate-limit`` option, the workers share the last
-displayed percentage instead, so that at most one line is written per
-percentage step of the run across all the workers: a run without a
-group regex would otherwise display one line per test. The percentage
-counts individual tests over the total number of tests of the run. The
-ETA extrapolates the average duration of the completed tests to the
-remaining ones, so it is only a rough estimate, and it stays unknown
-until the first group of tests completes.
+The display is off by default. The elapsed time and the ETA are computed
+from the timestamps the test results carry, so they stay unknown until a
+first test has completed, and the ETA is only a rough estimate. On a
+``--subunit`` output, where the test lines are rendered by the consumer
+of the stream, the same annotation is written to stderr for every
+completed test instead, interleaved with the output of the pipeline.
+
+The dynamic scheduler derives the generated test ids (e.g. the ids
+ddt generates from the iteration order of a set) with a shared hash
+seed: unless the user pinned ``PYTHONHASHSEED`` to a number, the run
+sets it to ``0`` for its child processes, which also keeps the ids
+stable across runs (the repository data, like the failure list and the
+timings, relies on that). The variable is restored after the run.
 
 Do note that the dynamic scheduler is still experimental and hasn't been as
 thoroughly tested as the default scheduler. It may not work in every use
@@ -566,9 +578,10 @@ the state of the run visible in real time:
   still alive.
 - When no group of tests finished across two consecutive watchdog
   ticks, the watchdog sends SIGUSR1 to the workers that are still
-  running, and each of them dumps its Python stack to stderr. The
-  frames of a hung test then show in the log, right below the ``START``
-  line of the last test it started.
+  running, one at a time (each worker at most once per stall), and each
+  of them dumps its Python stack to stderr. The frames of a hung test
+  then show in the log, right below the ``START`` line of the last test
+  it started.
 
 The option has no effect without ``--dynamic``, or when the concurrency
 is 1 (in which case the tests run in the non-dynamic mode anyway).

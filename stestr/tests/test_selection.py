@@ -76,6 +76,20 @@ class TestConstructList(base.TestCase):
         result = selection.construct_list(test_lists, regexes=["foo"])
         self.assertEqual(list(result), ["fake_test(scen)[egg,foo])"])
 
+    def test_input_order_preserved(self):
+        # The order of the returned list is the order the tests are
+        # executed in: it must match the order of the input, not the
+        # hash order of an intermediate set.
+        test_lists = ["fake_test2[tg]", "fake_test1[tg]", "fake_test3[tg]"]
+        self.assertEqual(selection.construct_list(test_lists), test_lists)
+
+    def test_input_order_preserved_with_exclusion(self):
+        test_lists = ["fake_test1[tg]", "fake_test2[tg]", "fake_test3[tg]"]
+        exclude_list = [(re.compile("fake_test2"), "fake_test2 not liked", [])]
+        with mock.patch("stestr.selection.exclusion_reader", return_value=exclude_list):
+            result = selection.construct_list(test_lists, exclude_list="file")
+        self.assertEqual(result, ["fake_test1[tg]", "fake_test3[tg]"])
+
     def test_simple_exclusion_re(self):
         test_lists = ["fake_test(scen)[tag,bar])", "fake_test(scen)[egg,foo])"]
         result = selection.construct_list(test_lists, exclude_regex="foo")

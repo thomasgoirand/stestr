@@ -128,8 +128,8 @@ class TestrConf:
         parallel_class=None,
         dynamic=False,
         dynamic_progress=False,
-        dynamic_progress_rate_limit=False,
         dynamic_debug=False,
+        report_missing_ids=True,
     ):
         """Get a test_processor.TestProcessorFixture for this config file
 
@@ -170,20 +170,18 @@ class TestrConf:
             matches on re.search() operation, it will be removed from the final
             test list.
         :param bool randomize: Randomize the test order after they are
-            partitioned into separate workers
+            partitioned into separate workers. With --dynamic the groups
+            are picked in a random order by the workers; with the
+            classic runner the list file fed to the runner is shuffled
+            and the runner honors its order
         :param bool parallel_class: Set the flag to group tests together in the
             stestr scheduler by class. If both this and the corresponding
             config file option which includes `group-regex` are set, this value
             will be used.
         :param bool dynamic: Enable dynamic scheduling
-        :param bool dynamic_progress: Display the completion of a dynamic
-            run (tests done, percentage, elapsed time and a rough ETA) on
-            stderr before running each next group of tests. Only used
-            when dynamic is true.
-        :param bool dynamic_progress_rate_limit: Rate limit the dynamic
-            run progress display to at most one line per percentage step
-            of the run across all the workers, instead of one line per
-            group. Implies dynamic_progress. Only used when dynamic is
+        :param bool dynamic_progress: Annotate the output of a dynamic
+            run with the progress of the run (tests done, percentage and
+            a rough ETA) next to each test. Only used when dynamic is
             true.
         :param bool dynamic_debug: Enable the debug output of the
             dynamic scheduler. Only used when dynamic is true.
@@ -269,8 +267,8 @@ class TestrConf:
             randomize=randomize,
             dynamic=dynamic,
             dynamic_progress=dynamic_progress,
-            dynamic_progress_rate_limit=dynamic_progress_rate_limit,
             dynamic_debug=dynamic_debug,
+            report_missing_ids=report_missing_ids,
             test_path=test_path,
             top_dir=top_dir,
         )

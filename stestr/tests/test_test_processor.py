@@ -98,20 +98,22 @@ def _read_connection_output(read_conn):
     return b"".join(chunks)
 
 
-class _FakeTestCase(unittest.TestCase):
-    def test_fake(self):
-        pass
+def _make_fake_testcase():
+    """Build a no-op test case class at call time.
 
+    The class is deliberately created inside this function, so that it
+    is never a module attribute: the discovery of the real suite must
+    not pick it up and run its no-op test.
+    """
 
-class _LeakyStdoutTestCase(unittest.TestCase):
-    # Test cases that leave sys.stdout replaced, like a test with a
-    # broken cleanup does: the dynamic worker must survive them.
+    class _FakeTestCase(unittest.TestCase):
+        def test_fake(self):
+            pass
 
-    def test_leak_stringio(self):
-        sys.stdout = io.StringIO()
-
-    def test_leak_mock(self):
-        sys.stdout = mock.Mock()
+    # unittest builds the test id from the qualified name: keep the same
+    # id as the module-level class this factory replaces had.
+    _FakeTestCase.__qualname__ = "_FakeTestCase"
+    return _FakeTestCase
 
 
 class TestDebugStreamResult(base.TestCase):
@@ -125,7 +127,7 @@ class TestDebugStreamResult(base.TestCase):
             debug_stream=debug_stream,
             worker_name="worker-0",
         )
-        runner.run(unittest.TestSuite([_FakeTestCase("test_fake")]))
+        runner.run(unittest.TestSuite([_make_fake_testcase()("test_fake")]))
         self.assertIn(
             "[stestr-dbg] worker-0 START %s\n" % self._test_id,
             debug_stream.getvalue(),
@@ -142,7 +144,12 @@ class TestDebugStreamResult(base.TestCase):
 
 @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
 class TestDynamicWorkerDebug(base.TestCase):
-    _test_id = "stestr.tests.test_test_processor._FakeTestCase.test_fake"
+    # A stable, importable test id from this module: the worker loads
+    # the tests by name, so the id must resolve in the worker process.
+    _test_id = (
+        "stestr.tests.test_test_processor"
+        ".TestTestProcessorFixture.test_start_process_linux"
+    )
 
     def _make_pipe(self):
         ctx = multiprocessing.get_context("spawn")
@@ -224,9 +231,9 @@ class TestDynamicWorkerDebug(base.TestCase):
         )
 
     def test_filtered_out_group_counts_tests_done(self):
-        # The test ids of a group filtered out entirely still count as
-        # done for the progress display, like they do for the debug
-        # watchdog counter.
+        # The test ids of a group filtered out entirely still count the
+        # group as done for the debug watchdog counter, like the groups
+        # that ran tests do.
         top_dir = self.useFixture(fixtures.TempDir()).path
         # Discovery imports the fixture module into sys.modules; pop it
         # so that a same-named module imported later from another
@@ -244,48 +251,38 @@ class TestDynamicWorkerDebug(base.TestCase):
             )
         read_conn, write_conn = self._make_pipe()
         debug_stream = io.StringIO()
-        stderr = io.StringIO()
-        tests_done = multiprocessing.Value("i", 0)
-        run_start = multiprocessing.Value("d", time.time())
+        groups_done = multiprocessing.Value("i", 0)
         job_queue = queue.Queue()
         job_queue.put(["test_user.TestDiscoverySeeding.test_missing"])
         job_queue.put(None)
-        with mock.patch.object(test_processor.sys, "stderr", stderr):
-            with mock.patch.object(test_processor.faulthandler, "register"):
-                test_processor._dynamic_worker(
-                    job_queue,
-                    write_conn,
-                    test_path=top_dir,
-                    top_dir=top_dir,
-                    debug=True,
-                    debug_stream=debug_stream,
-                    tests_done=tests_done,
-                    run_start=run_start,
-                    total_tests=1,
-                    progress=True,
-                )
+        with mock.patch.object(test_processor.faulthandler, "register"):
+            test_processor._dynamic_worker(
+                job_queue,
+                write_conn,
+                test_path=top_dir,
+                top_dir=top_dir,
+                debug=True,
+                debug_stream=debug_stream,
+                groups_done=groups_done,
+            )
         write_conn.close()
-        self.assertEqual(1, tests_done.value)
-        self.assertIn(
-            "[1/1 (100.0%) elapsed: 00:00:00, ETA: ~00:00:00]",
-            stderr.getvalue(),
-        )
+        self.assertEqual(1, groups_done.value)
 
 
 class _FakeWorkerProc:
-    def __init__(self, name, pid, ticks_alive, exitcode=None, on_tick=None):
+    def __init__(self, name, pid, exitcode=None, on_alive=None, alive=True):
         self.name = name
         self.pid = pid
         self.exitcode = exitcode
-        self._ticks = 0
-        self._ticks_alive = ticks_alive
-        self._on_tick = on_tick
+        self.on_alive = on_alive
+        self.alive = alive
+        self._alive_calls = 0
 
     def is_alive(self):
-        self._ticks += 1
-        if self._on_tick:
-            self._on_tick(self._ticks)
-        return self._ticks <= self._ticks_alive
+        self._alive_calls += 1
+        if self.on_alive:
+            self.on_alive(self._alive_calls)
+        return self.alive
 
 
 class _FakeCounter:
@@ -298,9 +295,14 @@ class TestDynamicDebugWatchdog(base.TestCase):
     def test_watchdog_dumps_stacks_after_two_stalled_ticks(self):
         debug_stream = io.StringIO()
         counter = _FakeCounter(0)
-        proc = _FakeWorkerProc("worker-0", 4242, 3)
+        proc = _FakeWorkerProc("worker-0", 4242)
+
+        def kill_worker(pid, signum):
+            # The dump unblocks the worker: it exits right after.
+            proc.alive = False
+
         with (
-            mock.patch("os.kill") as kill,
+            mock.patch("os.kill", side_effect=kill_worker) as kill,
             mock.patch.object(test_processor.time, "sleep") as sleep,
         ):
             test_processor._dynamic_debug_watchdog(
@@ -326,6 +328,42 @@ class TestDynamicDebugWatchdog(base.TestCase):
         ]
         self.assertEqual([], dump_delays)
 
+    def test_watchdog_dumps_stacks_once_per_stall(self):
+        # A stalled run must not have its workers re-signaled (and their
+        # stacks re-dumped) on every tick of the same stall: each worker
+        # is signaled at most once per stall, and again on the next
+        # stall report if the run is still stuck.
+        debug_stream = io.StringIO()
+        counter = _FakeCounter(0)
+        proc = _FakeWorkerProc("worker-0", 4242)
+        # The worker never exits and never finishes a group: the
+        # watchdog would loop forever, so stop it after a few stalled
+        # ticks.
+        stop = threading.Event()
+
+        def stop_after_a_few_ticks(alive_calls):
+            if alive_calls >= 6:
+                stop.set()
+
+        proc.on_alive = stop_after_a_few_ticks
+        with (
+            mock.patch("os.kill") as kill,
+            mock.patch.object(test_processor.time, "sleep"),
+        ):
+            test_processor._dynamic_debug_watchdog(
+                [{"proc": proc}],
+                counter,
+                1,
+                interval=0.01,
+                debug_stream=debug_stream,
+                stop_event=stop,
+            )
+        out = debug_stream.getvalue()
+        # One dump for the first stall, one more when the next stall
+        # report comes: the worker is not re-signaled within a stall.
+        self.assertEqual(1, out.count("dumping stacks of worker-0"))
+        kill.assert_called_once_with(4242, signal.SIGUSR1)
+
     def test_watchdog_signals_workers_one_at_a_time(self):
         # Every worker dumps its stack into the same debug stream: the
         # workers are signaled one at a time, each under a header line
@@ -333,17 +371,23 @@ class TestDynamicDebugWatchdog(base.TestCase):
         # previous dump had the time to land.
         debug_stream = io.StringIO()
         counter = _FakeCounter(0)
-        workers = [
-            {"proc": _FakeWorkerProc("worker-0", 4242, 3)},
-            {"proc": _FakeWorkerProc("worker-1", 4243, 3)},
-            {"proc": _FakeWorkerProc("worker-2", 4244, 3)},
+        procs = [
+            _FakeWorkerProc("worker-0", 4242),
+            _FakeWorkerProc("worker-1", 4243),
+            _FakeWorkerProc("worker-2", 4244),
         ]
+        by_pid = {proc.pid: proc for proc in procs}
+
+        def kill_worker(pid, signum):
+            # The dump unblocks the worker: it exits right after.
+            by_pid[pid].alive = False
+
         with (
-            mock.patch("os.kill") as kill,
+            mock.patch("os.kill", side_effect=kill_worker) as kill,
             mock.patch.object(test_processor.time, "sleep") as sleep,
         ):
             test_processor._dynamic_debug_watchdog(
-                workers,
+                [{"proc": proc} for proc in procs],
                 counter,
                 1,
                 interval=0.01,
@@ -382,12 +426,17 @@ class TestDynamicDebugWatchdog(base.TestCase):
 
         # The counter is bumped when the second tick starts, as if a
         # group of tests finished in between.
-        def bump_on_tick(tick):
-            if tick == 2:
+        def bump_on_second_call(alive_calls):
+            if alive_calls == 2:
                 counter.value = 1
 
-        proc = _FakeWorkerProc("worker-0", 4242, 4, on_tick=bump_on_tick)
-        with mock.patch("os.kill") as kill:
+        proc = _FakeWorkerProc("worker-0", 4242, on_alive=bump_on_second_call)
+
+        def kill_worker(pid, signum):
+            # The dump unblocks the worker: it exits right after.
+            proc.alive = False
+
+        with mock.patch("os.kill", side_effect=kill_worker) as kill:
             test_processor._dynamic_debug_watchdog(
                 [{"proc": proc}],
                 counter,
@@ -404,7 +453,7 @@ class TestDynamicDebugWatchdog(base.TestCase):
     def test_watchdog_stops_when_all_workers_exit(self):
         debug_stream = io.StringIO()
         counter = _FakeCounter(0)
-        proc = _FakeWorkerProc("worker-0", 4242, 0, exitcode=1)
+        proc = _FakeWorkerProc("worker-0", 4242, exitcode=1, alive=False)
         with mock.patch("os.kill") as kill:
             test_processor._dynamic_debug_watchdog(
                 [{"proc": proc}],
@@ -419,48 +468,6 @@ class TestDynamicDebugWatchdog(base.TestCase):
         kill.assert_not_called()
 
 
-class TestDynamicProgressFormat(base.TestCase):
-    def test_format_before_first_completion(self):
-        # The ETA is unknown until a first group of tests completed.
-        self.assertEqual(
-            "[0/312 (0.0%) elapsed: 00:01:23, ETA: unknown]",
-            test_processor._format_dynamic_progress(0, 312, 83),
-        )
-
-    def test_format_mid_run(self):
-        # 42 done tests over 312, 83s elapsed: the ETA extrapolates the
-        # average duration of the done tests to the 270 remaining ones.
-        self.assertEqual(
-            "[42/312 (13.5%) elapsed: 00:01:23, ETA: ~00:08:53]",
-            test_processor._format_dynamic_progress(42, 312, 83),
-        )
-
-    def test_format_completion(self):
-        self.assertEqual(
-            "[312/312 (100.0%) elapsed: 00:10:00, ETA: ~00:00:00]",
-            test_processor._format_dynamic_progress(312, 312, 600),
-        )
-
-    def test_format_rounds_the_percentage(self):
-        self.assertEqual(
-            "[1/3 (33.3%) elapsed: 00:00:09, ETA: ~00:00:18]",
-            test_processor._format_dynamic_progress(1, 3, 9),
-        )
-
-    def test_format_clamps_out_of_range_counts(self):
-        # A worker may run fewer tests than its group contains when the
-        # test ids cannot all be loaded; the display never goes out of
-        # range.
-        self.assertEqual(
-            "[3/3 (100.0%) elapsed: 00:00:30, ETA: ~00:00:00]",
-            test_processor._format_dynamic_progress(5, 3, 30),
-        )
-        self.assertEqual(
-            "[0/3 (0.0%) elapsed: 00:00:30, ETA: unknown]",
-            test_processor._format_dynamic_progress(-1, 3, 30),
-        )
-
-
 @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
 class TestDynamicWorker(base.TestCase):
     # A stable, importable test id from this module used to exercise the
@@ -470,12 +477,56 @@ class TestDynamicWorker(base.TestCase):
         ".TestTestProcessorFixture.test_start_process_linux"
     )
 
-    def _run_worker(self, job_queue):
+    def _run_worker(self, job_queue, test_path=None, top_dir=None):
         ctx = multiprocessing.get_context("spawn")
         read_conn, write_conn = ctx.Pipe(False)
-        test_processor._dynamic_worker(job_queue, write_conn)
+        test_processor._dynamic_worker(
+            job_queue, write_conn, test_path=test_path, top_dir=top_dir
+        )
         write_conn.close()
         return _read_connection_output(read_conn)
+
+    def _write_leaky_module(self):
+        """Write a temp module with tests that leave sys.stdout replaced.
+
+        The module is written to a temp directory instead of this one, so
+        that the real suite does not discover and run tests that
+        deliberately corrupt sys.stdout: a mock left in place of
+        sys.stdout would swallow the output of every test running after
+        it in the same worker.
+
+        Returns the top dir and the ids of the leaky tests and of a
+        normal test of the module.
+        """
+        top_dir = self.useFixture(fixtures.TempDir()).path
+        # The worker runs in this process (see _run_worker): the module
+        # imported by its discovery must be dropped from sys.modules, or
+        # a second temp module with the same name would fail to import.
+        self.addCleanup(sys.modules.pop, "test_leaky", None)
+        leaky_test = os.path.join(top_dir, "test_leaky.py")
+        with open(leaky_test, "w") as f:
+            f.write(
+                "import io\n"
+                "import sys\n"
+                "import unittest\n"
+                "from unittest import mock\n"
+                "\n"
+                "\n"
+                "class TestLeakyStdout(unittest.TestCase):\n"
+                "    def test_leak_stringio(self):\n"
+                "        sys.stdout = io.StringIO()\n"
+                "\n"
+                "    def test_leak_mock(self):\n"
+                "        sys.stdout = mock.Mock()\n"
+                "\n"
+                "    def test_ok(self):\n"
+                "        pass\n"
+            )
+        return top_dir, (
+            "test_leaky.TestLeakyStdout.test_leak_stringio",
+            "test_leaky.TestLeakyStdout.test_leak_mock",
+            "test_leaky.TestLeakyStdout.test_ok",
+        )
 
     def test_dynamic_worker_exits_on_sentinel(self):
         job_queue = queue.Queue()
@@ -507,36 +558,31 @@ class TestDynamicWorker(base.TestCase):
         # results of the next groups of the worker: the runner is bound
         # to the subunit stream wrapper, like the subprocess runner binds
         # its stream once, not to whatever sys.stdout points at.
-        leaky_id = (
-            "stestr.tests.test_test_processor"
-            "._LeakyStdoutTestCase.test_leak_stringio"
-        )
+        top_dir, (leaky_id, _, ok_id) = self._write_leaky_module()
         job_queue = queue.Queue()
         job_queue.put([leaky_id])
-        job_queue.put([self._test_id])
+        job_queue.put([ok_id])
         job_queue.put(None)
-        out = self._run_worker(job_queue)
+        out = self._run_worker(job_queue, test_path=top_dir, top_dir=top_dir)
         tests = _parse_subunit_output(out)
         statuses = {test["id"]: test["status"] for test in tests}
         self.assertEqual("success", statuses[leaky_id])
-        self.assertEqual("success", statuses[self._test_id])
+        self.assertEqual("success", statuses[ok_id])
 
     def test_worker_results_survive_mocked_stdout(self):
         # A mock left in place of sys.stdout must not silently swallow
         # the results of the next groups: the worker exits 0 either way,
         # but the tests must still be reported on the subunit stream.
-        leaky_id = (
-            "stestr.tests.test_test_processor" "._LeakyStdoutTestCase.test_leak_mock"
-        )
+        top_dir, (_, leaky_id, ok_id) = self._write_leaky_module()
         job_queue = queue.Queue()
         job_queue.put([leaky_id])
-        job_queue.put([self._test_id])
+        job_queue.put([ok_id])
         job_queue.put(None)
-        out = self._run_worker(job_queue)
+        out = self._run_worker(job_queue, test_path=top_dir, top_dir=top_dir)
         tests = _parse_subunit_output(out)
         statuses = {test["id"]: test["status"] for test in tests}
         self.assertEqual("success", statuses[leaky_id])
-        self.assertEqual("success", statuses[self._test_id])
+        self.assertEqual("success", statuses[ok_id])
 
     def test_worker_reports_missing_ids_as_failures(self):
         # An id that the discovery of the worker does not know (e.g. a
@@ -581,6 +627,88 @@ class TestDynamicWorker(base.TestCase):
             "success", statuses["test_user.TestDiscoverySeeding.test_here"]
         )
 
+    def test_worker_skips_missing_ids_from_user_list(self):
+        # When the id list was supplied by the user (--failing or
+        # --load-list) rather than produced by the listing of the
+        # project, an id that the discovery does not find is expected
+        # (the test may have been renamed since the list was written)
+        # and is skipped instead of reported as a failure.
+        top_dir = self.useFixture(fixtures.TempDir()).path
+        self.addCleanup(sys.modules.pop, "test_user", None)
+        user_test = os.path.join(top_dir, "test_user.py")
+        with open(user_test, "w") as f:
+            f.write(
+                "import unittest\n"
+                "\n"
+                "\n"
+                "class TestDiscoverySeeding(unittest.TestCase):\n"
+                "    def test_here(self):\n"
+                "        pass\n"
+            )
+        read_conn, write_conn = multiprocessing.get_context("spawn").Pipe(False)
+        job_queue = queue.Queue()
+        job_queue.put(
+            [
+                "test_user.TestDiscoverySeeding.test_missing",
+                "test_user.TestDiscoverySeeding.test_here",
+            ]
+        )
+        job_queue.put(None)
+        test_processor._dynamic_worker(
+            job_queue,
+            write_conn,
+            test_path=top_dir,
+            top_dir=top_dir,
+            report_missing_ids=False,
+        )
+        write_conn.close()
+        out = _read_connection_output(read_conn)
+        tests = _parse_subunit_output(out)
+        statuses = {test["id"]: test["status"] for test in tests}
+        self.assertNotIn("test_user.TestDiscoverySeeding.test_missing", statuses)
+        self.assertEqual(
+            "success", statuses["test_user.TestDiscoverySeeding.test_here"]
+        )
+
+    def test_worker_reports_import_errors_once_per_run(self):
+        # The workers of a run all discover the same tree: the discovery
+        # import errors are reported by the first worker that hits them
+        # only, so that the merged output of the parent does not repeat
+        # the same synthetic failure once per worker.
+        top_dir = self.useFixture(fixtures.TempDir()).path
+        self.addCleanup(sys.modules.pop, "test_user", None)
+        broken_test = os.path.join(top_dir, "test_broken.py")
+        with open(broken_test, "w") as f:
+            f.write("import not_a_real_module_xyz\n")
+        user_test = os.path.join(top_dir, "test_user.py")
+        with open(user_test, "w") as f:
+            f.write(
+                "import unittest\n"
+                "\n"
+                "\n"
+                "class TestDiscoverySeeding(unittest.TestCase):\n"
+                "    def test_here(self):\n"
+                "        pass\n"
+            )
+        errors_reported = multiprocessing.Value("b", 0)
+        outs = []
+        for _ in range(2):
+            read_conn, write_conn = multiprocessing.get_context("spawn").Pipe(False)
+            job_queue = queue.Queue()
+            job_queue.put(["test_user.TestDiscoverySeeding.test_here"])
+            job_queue.put(None)
+            test_processor._dynamic_worker(
+                job_queue,
+                write_conn,
+                test_path=top_dir,
+                top_dir=top_dir,
+                errors_reported=errors_reported,
+            )
+            write_conn.close()
+            outs.append(_read_connection_output(read_conn))
+        self.assertGreater(outs[0].count(b"stestr-worker-import-errors"), 0)
+        self.assertEqual(0, outs[1].count(b"stestr-worker-import-errors"))
+
     def test_worker_reports_discovery_import_errors(self):
         # A module that fails to import at discovery time must be
         # reported like the non-dynamic runner reports it: the run fails
@@ -621,106 +749,6 @@ class TestDynamicWorker(base.TestCase):
         self.assertEqual("fail", statuses["stestr-worker-import-errors"])
         self.assertIn(b"not_a_real_module_xyz", out)
 
-    def test_worker_reports_progress_and_counts_tests(self):
-        job_queue = queue.Queue()
-        job_queue.put([self._test_id])
-        job_queue.put([self._test_id])
-        job_queue.put(None)
-        read_conn, write_conn = multiprocessing.get_context("spawn").Pipe(False)
-        tests_done = multiprocessing.Value("i", 0)
-        run_start = multiprocessing.Value("d", time.time())
-        stderr = io.StringIO()
-        with mock.patch.object(test_processor.sys, "stderr", stderr):
-            test_processor._dynamic_worker(
-                job_queue,
-                write_conn,
-                tests_done=tests_done,
-                run_start=run_start,
-                total_tests=2,
-                progress=True,
-            )
-        write_conn.close()
-        read_conn.close()
-        # Each completed group of tests counts its test ids in the
-        # shared counter.
-        self.assertEqual(2, tests_done.value)
-        out = stderr.getvalue()
-        # A progress line is displayed before each group of tests runs.
-        self.assertIn("[0/2 (0.0%) elapsed: 00:00:00, ETA: unknown]\n", out)
-        self.assertIn("[1/2 (50.0%) elapsed: 00:00:00, ETA: ~00:00:00]\n", out)
-        # And the completion of the whole run is displayed once at the
-        # end, by the worker that ran the last group.
-        self.assertIn("[2/2 (100.0%) elapsed: 00:00:00, ETA: ~00:00:00]\n", out)
-
-    def test_worker_progress_gated_off(self):
-        # The progress display is opt-in: a worker without it stays
-        # silent even with the counters of the run.
-        job_queue = queue.Queue()
-        job_queue.put([self._test_id])
-        job_queue.put(None)
-        read_conn, write_conn = multiprocessing.get_context("spawn").Pipe(False)
-        tests_done = multiprocessing.Value("i", 0)
-        run_start = multiprocessing.Value("d", time.time())
-        stderr = io.StringIO()
-        with mock.patch.object(test_processor.sys, "stderr", stderr):
-            test_processor._dynamic_worker(
-                job_queue,
-                write_conn,
-                tests_done=tests_done,
-                run_start=run_start,
-                total_tests=1,
-            )
-        write_conn.close()
-        read_conn.close()
-        self.assertEqual("", stderr.getvalue())
-
-    def test_worker_progress_rate_limited(self):
-        # The workers share the last printed percentage: a line is only
-        # displayed when the percentage advances, so that a run without a
-        # group regex does not print one line per test.
-        job_queue = queue.Queue()
-        for _ in range(3):
-            job_queue.put([self._test_id] * 4)
-        job_queue.put(None)
-        read_conn, write_conn = multiprocessing.get_context("spawn").Pipe(False)
-        tests_done = multiprocessing.Value("i", 0)
-        run_start = multiprocessing.Value("d", time.time())
-        last_percent = multiprocessing.Value("i", -1)
-        stderr = io.StringIO()
-        with mock.patch.object(test_processor.sys, "stderr", stderr):
-            test_processor._dynamic_worker(
-                job_queue,
-                write_conn,
-                tests_done=tests_done,
-                run_start=run_start,
-                total_tests=1000,
-                progress=True,
-                last_percent=last_percent,
-            )
-        write_conn.close()
-        read_conn.close()
-        # The first line is displayed (0% over the last printed -1%), and
-        # the next groups stay below the next percentage step.
-        self.assertEqual(1, stderr.getvalue().count("["))
-
-    def test_worker_without_counters_does_not_display_progress(self):
-        # The progress display is driven by the counters shared with the
-        # parent: a worker without them (e.g. a direct worker call in a
-        # test) stays silent.
-        job_queue = queue.Queue()
-        job_queue.put([self._test_id])
-        job_queue.put(None)
-        read_conn, write_conn = multiprocessing.get_context("spawn").Pipe(False)
-        stderr = io.StringIO()
-        with mock.patch.object(test_processor.sys, "stderr", stderr):
-            test_processor._dynamic_worker(
-                job_queue,
-                write_conn,
-            )
-        write_conn.close()
-        read_conn.close()
-        self.assertEqual("", stderr.getvalue())
-
 
 class _RecordingProcess:
     """Proxy recording the start of a spawned worker process."""
@@ -756,9 +784,9 @@ class _RecordingContext:
             self._log.append("cancel_join_thread")
             real_cancel()
 
-        def put(item):
+        def put(item, *args, **kwargs):
             self._log.append(("put", item))
-            return real_put(item)
+            return real_put(item, *args, **kwargs)
 
         queue.cancel_join_thread = cancel_join_thread
         queue.put = put
@@ -798,7 +826,6 @@ class TestProcessorDynamicRun(base.TestCase):
         concurrency=2,
         dynamic_debug=False,
         dynamic_progress=False,
-        dynamic_progress_rate_limit=False,
     ):
         fixture = test_processor.TestProcessorFixture(
             test_ids,
@@ -810,7 +837,6 @@ class TestProcessorDynamicRun(base.TestCase):
             dynamic=True,
             dynamic_debug=dynamic_debug,
             dynamic_progress=dynamic_progress,
-            dynamic_progress_rate_limit=dynamic_progress_rate_limit,
         )
         return self.useFixture(fixture)
 
@@ -824,7 +850,7 @@ class TestProcessorDynamicRun(base.TestCase):
             self.assertIn("proc", worker)
             worker["proc"].join()
             self.assertEqual(0, worker["proc"].exitcode)
-            with os.fdopen(worker["stream"], "rb") as stream:
+            with worker["stream"] as stream:
                 outputs.append(stream.read())
         tests = _parse_subunit_output(b"".join(outputs))
         statuses = {test["id"]: test["status"] for test in tests}
@@ -843,7 +869,7 @@ class TestProcessorDynamicRun(base.TestCase):
             self.assertEqual(0, worker["proc"].exitcode)
         outputs = []
         for worker in workers:
-            with os.fdopen(worker["stream"], "rb") as stream:
+            with worker["stream"] as stream:
                 outputs.append(stream.read())
         tests = _parse_subunit_output(b"".join(outputs))
         statuses = {test["id"]: test["status"] for test in tests}
@@ -880,56 +906,22 @@ class TestProcessorDynamicRun(base.TestCase):
         with open(stderr_path) as stderr_file:
             self.assertEqual("", stderr_file.read())
 
-    def test_dynamic_run_progress_enabled(self):
-        # With the display enabled, each worker displays the completion
-        # of the whole run on stderr right before running its next group
-        # of tests.
-        fixture = self._get_dynamic_fixture([self._test_id], dynamic_progress=True)
-        stderr_path = self._capture_workers_stderr(fixture)
-        with open(stderr_path) as stderr_file:
-            stderr_out = stderr_file.read()
-        self.assertIn("[0/1 (0.0%) elapsed:", stderr_out)
-        self.assertIn("[1/1 (100.0%)", stderr_out)
-        self.assertEqual(1, fixture._tests_done.value)
+    def test_dynamic_run_exposes_total_tests(self):
+        # The total number of tests of the run is exposed for the
+        # parent, which needs it to render the results of the run.
+        fixture = self._get_dynamic_fixture([self._test_id])
+        fixture.run_tests()
+        self.assertEqual(1, fixture._total_tests)
 
-    def test_dynamic_run_progress_line_per_group(self):
-        # Without rate limiting one line is displayed before each of the
-        # three groups, plus the final one: 4 lines in total, whichever
-        # worker picked which group. A slow worker may only start after
-        # the others already completed tests, so the counts shown by the
-        # pre-group lines are scheduling dependent.
-        test_ids = [
-            "stestr.tests.test_test_processor"
-            ".TestTestProcessorFixture.test_start_process_linux",
-            "stestr.tests.test_test_processor"
-            ".TestDynamicWorker.test_dynamic_worker_exits_on_sentinel",
-            "stestr.tests.test_test_processor"
-            ".TestDynamicWorker.test_dynamic_worker_runs_queued_tests",
-        ]
-        fixture = self._get_dynamic_fixture(test_ids, dynamic_progress=True)
+    def test_dynamic_run_workers_stay_silent(self):
+        # The results of the workers only go to their subunit stream:
+        # whatever the run options are, the workers stay silent on
+        # stderr, so that their output cannot interleave with the
+        # rendering of the parent.
+        fixture = self._get_dynamic_fixture([self._test_id])
         stderr_path = self._capture_workers_stderr(fixture)
         with open(stderr_path) as stderr_file:
-            stderr_out = stderr_file.read()
-        self.assertEqual(4, stderr_out.count("elapsed:"))
-        self.assertEqual(1, stderr_out.count("[3/3"))
-
-    def test_dynamic_run_progress_rate_limited(self):
-        # With the rate limited display the workers share the last
-        # displayed percentage: the identical [0/N ...] lines collapse
-        # into a single line.
-        test_ids = [
-            "stestr.tests.test_test_processor"
-            ".TestTestProcessorFixture.test_start_process_linux",
-            "stestr.tests.test_test_processor"
-            ".TestDynamicWorker.test_dynamic_worker_exits_on_sentinel",
-            "stestr.tests.test_test_processor"
-            ".TestDynamicWorker.test_dynamic_worker_runs_queued_tests",
-        ]
-        fixture = self._get_dynamic_fixture(test_ids, dynamic_progress_rate_limit=True)
-        stderr_path = self._capture_workers_stderr(fixture)
-        with open(stderr_path) as stderr_file:
-            stderr_out = stderr_file.read()
-        self.assertEqual(1, stderr_out.count("[0/3"))
+            self.assertEqual("", stderr_file.read())
 
     def test_dynamic_run_shares_hash_seed(self):
         # The listing process and the workers must generate the same test
@@ -943,11 +935,97 @@ class TestProcessorDynamicRun(base.TestCase):
             self.assertEqual("0", os.environ["PYTHONHASHSEED"])
 
     def test_dynamic_run_honors_existing_hash_seed(self):
-        # A seed the user set explicitly is not overridden.
+        # A seed the user set explicitly is not overridden, and is
+        # restored after the fixture is torn down.
         with mock.patch.dict(os.environ):
             os.environ["PYTHONHASHSEED"] = "5"
-            self._get_dynamic_fixture([self._test_id])
+            fixture = test_processor.TestProcessorFixture(
+                [self._test_id],
+                "python -m stestr.subunit_runner.run $IDOPTION",
+                "--list",
+                "--load-list $IDFILE",
+                None,
+                concurrency=2,
+                dynamic=True,
+            )
+            with fixture:
+                self.assertEqual("5", os.environ["PYTHONHASHSEED"])
             self.assertEqual("5", os.environ["PYTHONHASHSEED"])
+
+    def test_dynamic_run_restores_hash_seed(self):
+        # The seed set for the run is removed again when the fixture is
+        # torn down: the environment of the process must not be mutated
+        # permanently.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PYTHONHASHSEED", None)
+            fixture = test_processor.TestProcessorFixture(
+                [self._test_id],
+                "python -m stestr.subunit_runner.run $IDOPTION",
+                "--list",
+                "--load-list $IDFILE",
+                None,
+                concurrency=2,
+                dynamic=True,
+            )
+            with fixture:
+                self.assertEqual("0", os.environ["PYTHONHASHSEED"])
+            self.assertNotIn("PYTHONHASHSEED", os.environ)
+
+    def test_dynamic_run_overrides_random_hash_seed(self):
+        # "random" makes every child process pick its own seed, which
+        # makes the generated test ids diverge between the workers: it
+        # is treated as unset. The user value is restored afterwards.
+        with mock.patch.dict(os.environ):
+            os.environ["PYTHONHASHSEED"] = "random"
+            fixture = test_processor.TestProcessorFixture(
+                [self._test_id],
+                "python -m stestr.subunit_runner.run $IDOPTION",
+                "--list",
+                "--load-list $IDFILE",
+                None,
+                concurrency=2,
+                dynamic=True,
+            )
+            with fixture:
+                self.assertEqual("0", os.environ["PYTHONHASHSEED"])
+            self.assertEqual("random", os.environ["PYTHONHASHSEED"])
+
+    def test_dynamic_run_overrides_empty_hash_seed(self):
+        # The empty value has the same recreate-per-process behavior as
+        # "random": it is treated as unset too.
+        with mock.patch.dict(os.environ):
+            os.environ["PYTHONHASHSEED"] = ""
+            fixture = test_processor.TestProcessorFixture(
+                [self._test_id],
+                "python -m stestr.subunit_runner.run $IDOPTION",
+                "--list",
+                "--load-list $IDFILE",
+                None,
+                concurrency=2,
+                dynamic=True,
+            )
+            with fixture:
+                self.assertEqual("0", os.environ["PYTHONHASHSEED"])
+            self.assertEqual("", os.environ["PYTHONHASHSEED"])
+
+    def test_dynamic_serial_fallback_does_not_touch_hash_seed(self):
+        # A dynamic run that degenerates to the classic serial runner
+        # (concurrency 1) spawns no worker: it must not touch the
+        # environment either.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PYTHONHASHSEED", None)
+            fixture = test_processor.TestProcessorFixture(
+                [self._test_id],
+                "python -m stestr.subunit_runner.run $IDOPTION",
+                "--list",
+                "--load-list $IDFILE",
+                None,
+                concurrency=1,
+                dynamic=True,
+            )
+            with fixture:
+                self.assertNotIn("PYTHONHASHSEED", os.environ)
+            self.assertNotIn("PYTHONHASHSEED", os.environ)
 
     def test_classic_run_does_not_touch_hash_seed(self):
         # Only the dynamic scheduler needs the shared seed: the classic
@@ -984,7 +1062,7 @@ class TestProcessorDynamicRun(base.TestCase):
         generate.assert_not_called()
         outputs = []
         for worker in workers:
-            with os.fdopen(worker["stream"], "rb") as stream:
+            with worker["stream"] as stream:
                 outputs.append(stream.read())
         tests = _parse_subunit_output(b"".join(outputs))
         statuses = {test["id"]: test["status"] for test in tests}
@@ -1034,8 +1112,48 @@ class TestProcessorDynamicRun(base.TestCase):
             sleeper = ctx.Process(target=time.sleep, args=(60,))
             sleeper.start()
             workers[0]["proc"] = sleeper
+            # Shrink the join timeout of the finalizer, so that the
+            # terminate-then-kill ladder of the stuck worker does not
+            # slow the test down.
+            fixture._dynamic_join_timeout = 0.1
         sleeper.join(timeout=5)
         self.assertIsNotNone(sleeper.exitcode)
+
+    def test_dynamic_terminate_kills_stuck_worker(self):
+        # A worker that does not exit on its own (e.g. one blocked
+        # writing to a pipe nobody reads) is terminated, then killed if
+        # terminating was not enough.
+        fixture = self._get_dynamic_fixture([self._test_id])
+        proc = mock.Mock()
+        # is_alive() is checked after each join: still alive after the
+        # plain join, still alive after terminate, gone after kill.
+        proc.is_alive.side_effect = [True, True, False]
+        fixture._terminate_dynamic_workers([{"proc": proc, "stream": None}])
+        self.assertEqual(
+            [mock.call(timeout=fixture._dynamic_join_timeout)] * 3,
+            proc.join.call_args_list,
+        )
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+
+    def test_dynamic_until_failure_finishes_previous_iteration(self):
+        # --until-failure calls run_tests() repeatedly on the same
+        # fixture, and the streams of an iteration are only fully
+        # consumed after run_tests() returned: the workers of an
+        # iteration are therefore collected when the next iteration
+        # starts, and their stream fds must not leak into it.
+        fixture = self._get_dynamic_fixture([self._test_id])
+        first_workers = fixture.run_tests()
+        second_workers = fixture.run_tests()
+        for worker in first_workers:
+            worker["proc"].join()
+            self.assertIsNotNone(worker["proc"].exitcode)
+            # The stream of the first iteration was closed by the start
+            # of the second one.
+            self.assertIsNone(worker["stream"])
+        for worker in second_workers:
+            worker["proc"].join()
+            self.assertEqual(0, worker["proc"].exitcode)
 
     def test_dynamic_run_tests_progress_display(self):
         # A run without any matching test spawns no worker and displays
@@ -1060,7 +1178,7 @@ class TestProcessorDynamicRun(base.TestCase):
                 for worker in workers:
                     worker["proc"].join()
                     self.assertEqual(0, worker["proc"].exitcode)
-                    with os.fdopen(worker["stream"], "rb") as stream:
+                    with worker["stream"] as stream:
                         outputs.append(stream.read())
             finally:
                 os.dup2(stderr_fd, 2)
@@ -1123,7 +1241,7 @@ class TestDynamicDiscoverySeeding(base.TestCase):
         for worker in workers:
             worker["proc"].join()
             self.assertEqual(0, worker["proc"].exitcode)
-            with os.fdopen(worker["stream"], "rb") as stream:
+            with worker["stream"] as stream:
                 outputs.append(stream.read())
         tests = _parse_subunit_output(b"".join(outputs))
         statuses = {test["id"]: test["status"] for test in tests}
@@ -1185,7 +1303,7 @@ class TestDynamicDiscoverySeeding(base.TestCase):
         for worker in workers:
             worker["proc"].join()
             self.assertEqual(0, worker["proc"].exitcode)
-            with os.fdopen(worker["stream"], "rb") as stream:
+            with worker["stream"] as stream:
                 outputs.append(stream.read())
         tests = _parse_subunit_output(b"".join(outputs))
         statuses = {test["id"]: test["status"] for test in tests}

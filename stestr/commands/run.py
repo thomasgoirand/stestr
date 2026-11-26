@@ -278,20 +278,12 @@ class Run(command.Command):
             "--dynamic-progress",
             action="store_true",
             default=False,
-            help="Display the completion of a dynamic run (tests done, "
-            "percentage, elapsed time and a rough ETA) on stderr before "
-            "running each next group of tests. This option has no effect "
-            "without --dynamic.",
-        )
-        parser.add_argument(
-            "--dynamic-progress-rate-limit",
-            action="store_true",
-            default=False,
-            help="Rate limit the --dynamic-progress display to at most "
-            "one line per percentage step of the run across all the "
-            "workers, instead of one line per group. Implies "
-            "--dynamic-progress. This option has no effect without "
-            "--dynamic.",
+            help="Annotate the output of a dynamic run with the progress "
+            "of the run (tests done, percentage and a rough ETA) next to "
+            "each test. On a --subunit output, where the tests are "
+            "rendered by the consumer of the stream, the same annotation "
+            "is written to stderr for every completed test. This option "
+            "has no effect without --dynamic.",
         )
         return parser
 
@@ -386,7 +378,6 @@ class Run(command.Command):
             pdb=args.pdb,
             dynamic=args.dynamic,
             dynamic_progress=args.dynamic_progress,
-            dynamic_progress_rate_limit=args.dynamic_progress_rate_limit,
             dynamic_debug=args.dynamic_debug,
         )
 
@@ -451,7 +442,6 @@ def run_command(
     pdb=False,
     dynamic=False,
     dynamic_progress=False,
-    dynamic_progress_rate_limit=False,
     dynamic_debug=False,
 ):
     """Function to execute the run command
@@ -497,7 +487,10 @@ def run_command(
         discover and just execute the test specified. A file name may be used
         in place of a test name.
     :param bool random: Randomize the test order after they are partitioned
-        into separate workers
+        into separate workers. With --dynamic the groups are picked in a
+        random order by the workers; with the classic runner the list
+        file fed to the runner is shuffled and the runner honors its
+        order
     :param bool combine: Combine the results from the test run with the
         last run in the repository
     :param list filters: A list of string regex filters to initially apply on
@@ -518,14 +511,11 @@ def run_command(
         discover and just execute the test specified without launching any
         additional processes. A file name may be used in place of a test name.
     :param bool dynamic: Enable dynamic scheduling
-    :param bool dynamic_progress: Display the completion of a dynamic run
-        on stderr before running each next group of tests. Has no effect
-        when dynamic is not set.
-    :param bool dynamic_progress_rate_limit: Rate limit the dynamic run
-        progress display to at most one line per percentage step of the
-        run across all the workers, instead of one line per group.
-        Implies dynamic_progress. Has no effect when dynamic is not
-        set.
+    :param bool dynamic_progress: Annotate the output of a dynamic run
+        with the progress of the run (tests done, percentage and a rough
+        ETA) next to each test. On a --subunit output the same
+        annotation is written to stderr for every completed test. Has no
+        effect when dynamic is not set.
     :param bool dynamic_debug: Enable the debug output of the dynamic
         scheduler. Has no effect when dynamic is not set.
 
@@ -533,16 +523,18 @@ def run_command(
         for failures.
     :rtype: int
     """
-    if dynamic and sys.platform == "win32":
-        msg = "The dynamic scheduler is not supported on Windows\n"
-        stdout.write(msg)
-        return 2
-    if dynamic and any((isolated, analyze_isolation, no_discover, pdb, worker_path)):
+    if dynamic and any(
+        (isolated, analyze_isolation, no_discover, pdb, worker_path, serial)
+    ):
         msg = (
             "--dynamic cannot be combined with --isolated, "
-            "--analyze-isolation, --no-discover, --pdb or --worker-file: "
-            "the dynamic scheduler does not support them\n"
+            "--analyze-isolation, --no-discover, --pdb, --worker-file "
+            "or --serial: the dynamic scheduler does not support them\n"
         )
+        stdout.write(msg)
+        return 2
+    if dynamic and sys.platform == "win32":
+        msg = "The dynamic scheduler is not supported on Windows\n"
         stdout.write(msg)
         return 2
     try:
@@ -581,7 +573,10 @@ def run_command(
         )
         stdout.write(msg)
         return 2
-    if dynamic:
+    if dynamic and concurrency != 1:
+        # A dynamic run with a concurrency of 1 degenerates to the
+        # classic serial runner, which spawns no worker: the warning is
+        # only meaningful when the dynamic scheduler actually runs.
         warnings.warn(
             "WARNING: The dynamic scheduler is still experimental. "
             "You might encounter issues while using it"
@@ -740,8 +735,12 @@ def run_command(
             randomize=random,
             dynamic=dynamic,
             dynamic_progress=dynamic_progress,
-            dynamic_progress_rate_limit=dynamic_progress_rate_limit,
             dynamic_debug=dynamic_debug,
+            # When the id list was supplied by the user (--failing or
+            # --load-list) rather than produced by the listing of the
+            # project, an id missing from the discovery of a worker is
+            # expected and must not fail the run.
+            report_missing_ids=ids is None,
         )
         if isolated:
             result = 0
@@ -888,7 +887,7 @@ def _run_tests(
                     (
                         "subunit",
                         output.ReturnCodeToSubunit(
-                            os.fdopen(proc["stream"], "rb"),
+                            proc["stream"],
                             worker=proc["proc"],
                             dynamic=True,
                         ),
@@ -911,6 +910,17 @@ def _run_tests(
                 suppress_attachments=suppress_attachments,
                 all_attachments=all_attachments,
                 show_binary_attachments=show_binary_attachments,
+                # The total number of tests of the run, for the progress
+                # annotation (--dynamic-progress). Only the dynamic
+                # scheduler knows it: the fixture computed it when
+                # scheduling the groups.
+                dynamic_progress_total=(
+                    getattr(cmd, "_total_tests", None) if cmd.dynamic_progress else None
+                ),
+                # The number of worker streams, so that the worker
+                # prefix of each result line is right-aligned on the
+                # width of the largest worker number.
+                worker_count=len(run_procs),
             )
 
         if not until_failure:

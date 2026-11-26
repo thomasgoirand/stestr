@@ -75,6 +75,38 @@ def filter_by_ids(suite_or_case, test_ids):
     return suite_or_case
 
 
+def order_suite_by_ids(suite, test_ids):
+    """Order the tests of a suite according to a list of test ids.
+
+    Rebuilds the suite with the tests sorted in the order of test_ids:
+    the runner honors the order of the id list it was given (--random
+    feeds a shuffled list). Unknown ids are skipped, a duplicated id is
+    only run once, and ids of the suite that are not in the list (which
+    the discovery kept but the list did not mention) are appended at the
+    end in their original order, so that no test is lost.
+
+    :param suite: A test suite.
+    :param test_ids: The ordered test ids.
+    :return: A new unittest.TestSuite with the tests in order.
+    """
+    by_id = {}
+    for test in iterate_tests(suite):
+        by_id.setdefault(test.id(), test)
+    ordered = []
+    seen = set()
+    for test_id in test_ids:
+        if test_id in seen:
+            continue
+        seen.add(test_id)
+        test = by_id.pop(test_id, None)
+        if test is not None:
+            ordered.append(test)
+    # The tests the list did not mention keep running at the end, in
+    # their original order.
+    ordered.extend(by_id.values())
+    return unittest.TestSuite(ordered)
+
+
 def iterate_tests(test_suite_or_case):
     """Iterate through all of the test cases in 'test_suite_or_case'."""
     try:
@@ -188,8 +220,15 @@ class TestProgram(unittest.TestProgram):
                 lines = source.readlines()
             finally:
                 source.close()
+            # The order of the list file is honored: --random feeds the
+            # runner a shuffled list, and the tests are run in the order
+            # of that list, not in the discovery order (which would make
+            # the shuffling a no-op).
             test_ids = {line.strip().decode("utf-8") for line in lines}
             self.test = filter_by_ids(self.test, test_ids)
+            self.test = order_suite_by_ids(
+                self.test, [line.strip().decode("utf-8") for line in lines]
+            )
         # XXX: Local edit (see http://bugs.python.org/issue22860)
         if not self.listtests:
             self.runTests()

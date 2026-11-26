@@ -39,6 +39,133 @@ DAY_SECONDS = 60 * 60 * 24
 FAILS = []
 RESULTS = {}
 
+# The test statuses that mark the end of a test, used by the progress
+# annotation of a dynamic scheduler run (see DynamicProgress).
+_PROGRESS_FINAL_STATUSES = frozenset(
+    ["success", "fail", "skip", "xfail", "uxsuccess", "uxfail"]
+)
+
+
+def _format_progress_duration(seconds):
+    """Format a duration as ~HH:MM:SS for a progress display."""
+    seconds = int(seconds)
+    return "~%02d:%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+
+
+def _format_elapsed_seconds(seconds):
+    """Format a measured duration as HH:MM:SS, without the ETA tilde."""
+    seconds = int(seconds)
+    return "%02d:%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60, seconds % 60)
+
+
+class DynamicProgress:
+    """Compute the progress annotation of a dynamic scheduler run.
+
+    With --dynamic-progress, each test line of the run output is
+    annotated with the progress of the run: the number of tests already
+    completed (the test on the line included), the corresponding
+    percentage and a rough ETA extrapolating the average duration of the
+    completed tests to the remaining ones, e.g.
+    ``[ 42/312 (13.5%) Time: 00:00:33, ETA: ~00:08:53]``.
+
+    The numbers are computed from the completion timestamps the subunit
+    stream carries, so the annotation needs no shared state with the
+    workers of the run. The elapsed time and the ETA are unknown until a
+    first test completed.
+
+    :param int total_tests: The total number of tests scheduled for the
+        run.
+    """
+
+    def __init__(self, total_tests):
+        self.total_tests = total_tests
+        self.done = 0
+        self.start_time = None
+        self.last_time = None
+
+    def record_start(self, timestamp=None):
+        """Account the start timestamp of a test of the run."""
+        if timestamp is not None and (
+            self.start_time is None or timestamp < self.start_time
+        ):
+            self.start_time = timestamp
+
+    def record_stop(self, timestamp=None):
+        """Account a completed test and its completion timestamp."""
+        if timestamp is not None:
+            self.last_time = timestamp
+        self.done += 1
+
+    def elapsed_time(self):
+        """Render the time elapsed since the first test started."""
+        if self.start_time is None or self.last_time is None:
+            return "unknown"
+        return _format_elapsed_seconds(
+            (self.last_time - self.start_time).total_seconds()
+        )
+
+    def eta(self):
+        elapsed = None
+        if self.start_time is not None and self.last_time is not None:
+            elapsed = (self.last_time - self.start_time).total_seconds()
+        done = min(max(self.done, 0), self.total_tests)
+        if not self.total_tests or not done:
+            return "unknown"
+        if done >= self.total_tests:
+            return "~00:00:00"
+        return _format_progress_duration(elapsed / done * (self.total_tests - done))
+
+    def __str__(self):
+        done = min(max(self.done, 0), self.total_tests)
+        percent = 100.0 * done / self.total_tests if self.total_tests else 100.0
+        return "[ %d/%d (%.1f%%) Time: %s, ETA: %s]" % (
+            done,
+            self.total_tests,
+            percent,
+            self.elapsed_time(),
+            self.eta(),
+        )
+
+
+class DynamicProgressReporter(testtools.StreamResult):
+    """Emit the progress annotation of a run on stderr, per test.
+
+    Used on the raw subunit stream path (--subunit): the per-test lines
+    are rendered by the consumer of the stream, which stestr cannot
+    annotate, so the same annotation as the subunit-trace one is written
+    to stderr for every completed test, interleaved with the output of
+    the pipeline.
+
+    :param progress: The DynamicProgress instance accounting the run.
+    :param stream: The stream the annotations are written to, defaults
+        to sys.stderr.
+    """
+
+    def __init__(self, progress, stream=None):
+        super().__init__()
+        self._progress = progress
+        self._stream = stream if stream is not None else sys.stderr
+
+    def status(
+        self,
+        test_id=None,
+        test_status=None,
+        test_tags=None,
+        runnable=True,
+        file_name=None,
+        file_bytes=None,
+        eof=False,
+        mime_type=None,
+        route_code=None,
+        timestamp=None,
+    ):
+        if test_status == "inprogress":
+            self._progress.record_start(timestamp)
+        elif test_status in _PROGRESS_FINAL_STATUSES:
+            self._progress.record_stop(timestamp)
+            self._stream.write("%s %s\n" % (self._progress, test_id))
+            self._stream.flush()
+
 
 def total_seconds(timedelta):
     # NOTE(mtreinish): This method is built-in to the timedelta class in
@@ -101,6 +228,45 @@ def find_worker(test):
         if tag.startswith("worker-"):
             return int(tag[7:])
     return 0
+
+
+def worker_tag(worker, worker_count=1):
+    """Render the worker prefix of a result line.
+
+    The number is right-aligned on the width of the largest worker
+    number of the run, so that the result lines line up: a run with
+    less than 10 workers uses one character, more than 99 three.
+    """
+    width = max(len(str(max(worker_count - 1, 0))), 1)
+    return "{{{}}}".format(str(worker).rjust(width))
+
+
+class DiscardAttachments(testtools.StreamResult):
+    """Swallow the file attachment events of a subunit stream.
+
+    The runner streams carry the stdout/stderr of the tests as file
+    attachments, in chunks without a test id. Their relevant content is
+    already rendered by the per-test output of the failing tests, and
+    tests often print unstructured data (e.g. generated resource names)
+    without trailing newlines, which catted verbatim would corrupt the
+    rendering of the next result line. Dropping the raw chunks keeps
+    the output aligned, like the subunit2pyunit pipelines do.
+    """
+
+    def status(
+        self,
+        test_id=None,
+        test_status=None,
+        test_tags=None,
+        runnable=True,
+        file_name=None,
+        file_bytes=None,
+        eof=False,
+        mime_type=None,
+        route_code=None,
+        timestamp=None,
+    ):
+        pass
 
 
 # Print out stdout/stderr if it exists, always
@@ -168,6 +334,8 @@ def show_outcome(
     suppress_attachments=False,
     all_attachments=False,
     show_binary_attachments=True,
+    progress=None,
+    worker_count=1,
 ):
     global RESULTS
     status = test["status"]
@@ -187,6 +355,19 @@ def show_outcome(
     if name == "process-returncode":
         return
 
+    # The progress annotation of a dynamic scheduler run, displayed at
+    # the beginning of every test line: the test on the line is counted
+    # as completed, and the start timestamps of the tests bound the
+    # elapsed time of the run.
+    if progress is not None:
+        timestamps = test.get("timestamps") or []
+        if timestamps:
+            progress.record_start(timestamps[0])
+            progress.record_stop(timestamps[-1])
+        else:
+            progress.record_stop(None)
+    annotation = "%s " % progress if progress is not None else ""
+
     for color in [colorizer.AnsiColorizer, colorizer.NullColorizer]:
         if not enable_color:
             color = colorizer.NullColorizer(stream)
@@ -200,7 +381,11 @@ def show_outcome(
         if abbreviate:
             color.write("F", "red")
         else:
-            stream.write("{{{}}} {} [{}] ... ".format(worker, name, duration))
+            stream.write(
+                "{} {}{} [{}] ... ".format(
+                    worker_tag(worker, worker_count), annotation, name, duration
+                )
+            )
             color.write("FAILED", "red")
             stream.write("\n")
             if not print_failures:
@@ -215,7 +400,9 @@ def show_outcome(
             if abbreviate:
                 color.write(".", "green")
             else:
-                out_string = "{{{}}} {} [{}".format(worker, name, duration)
+                out_string = "{} {}{} [{}".format(
+                    worker_tag(worker, worker_count), annotation, name, duration
+                )
                 perc_diff = find_test_run_time_diff(test["id"], duration)
                 if enable_diff:
                     if perc_diff and abs(perc_diff) >= abs(float(threshold)):
@@ -240,7 +427,11 @@ def show_outcome(
                 reason = test["details"].get("reason", "")
                 if reason:
                     reason = ": " + reason.as_text()
-                stream.write("{{{}}} {} ... ".format(worker, name))
+                stream.write(
+                    "{} {}{} ... ".format(
+                        worker_tag(worker, worker_count), annotation, name
+                    )
+                )
                 color.write("SKIPPED", "blue")
                 stream.write("%s" % (reason))
                 stream.write("\n")
@@ -249,8 +440,12 @@ def show_outcome(
                 stream.write("%s" % test["status"][0])
             else:
                 stream.write(
-                    "{{{}}} {} [{}] ... {}\n".format(
-                        worker, name, duration, test["status"]
+                    "{} {}{} [{}] ... {}\n".format(
+                        worker_tag(worker, worker_count),
+                        annotation,
+                        name,
+                        duration,
+                        test["status"],
                     )
                 )
                 if not print_failures:
@@ -424,6 +619,8 @@ def trace(
     suppress_attachments=False,
     all_attachments=False,
     show_binary_attachments=False,
+    progress=None,
+    worker_count=1,
 ):
     stream = subunit.ByteStreamToStreamResult(stdin, non_subunit_name="stdout")
     # Reset the module level state so that a trace run is not polluted by
@@ -443,12 +640,14 @@ def trace(
             suppress_attachments=suppress_attachments,
             all_attachments=all_attachments,
             show_binary_attachments=show_binary_attachments,
+            progress=progress,
+            worker_count=worker_count,
         )
     )
     summary = testtools.StreamSummary()
     result = testtools.CopyStreamResult([outcomes, summary])
     result = testtools.StreamResultRouter(result)
-    cat = subunit.test_results.CatFiles(stdout)
+    cat = DiscardAttachments()
     result.add_rule(cat, "test_id", test_id=None)
     result.startTestRun()
     try:

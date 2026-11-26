@@ -480,42 +480,41 @@ class TestReturnCodes(base.TestCase):
 
     @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
     def test_dynamic_progress_display(self):
-        # The progress display is opt-in with --dynamic-progress, and
-        # each worker displays a line before running its next group of
-        # tests.
+        # The progress display is opt-in with --dynamic-progress: with
+        # the subunit-trace output every test line is annotated with the
+        # progress of the run (tests done, percentage and a rough ETA).
         out, err = self.assertRunExit(
             "stestr run --dynamic --dynamic-progress --concurrency 2 passing", 0
         )
         self.assertRegex(
-            err.decode(),
-            r"\[\d+/\d+ \(\d+\.\d%\) elapsed: \d+:\d+:\d+, "
-            r"ETA: (~\d+:\d+:\d+|unknown)\]",
+            out.decode(),
+            r"\{ *\d+\} \[ \d+/\d+ \(\d+\.\d%\) Time: "
+            r"(\d+:\d+:\d+|unknown), ETA: (~\d+:\d+:\d+|unknown)\] ",
         )
 
     @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
-    def test_dynamic_progress_rate_limited(self):
-        # The optional rate limit collapses the display to at most one
-        # line per percentage step of the run.
+    def test_dynamic_progress_subunit_display(self):
+        # On a --subunit output the per-test lines are rendered by the
+        # consumer of the stream: the same progress annotation is
+        # written to stderr for every completed test instead.
         out, err = self.assertRunExit(
-            "stestr run --dynamic --dynamic-progress-rate-limit"
-            " --concurrency 2 passing",
+            "stestr run --dynamic --dynamic-progress --concurrency 2 passing"
+            " --subunit",
             0,
         )
         self.assertRegex(
             err.decode(),
-            r"\[\d+/\d+ \(\d+\.\d%\) elapsed: \d+:\d+:\d+, "
-            r"ETA: (~\d+:\d+:\d+|unknown)\]",
+            r"\[ \d+/\d+ \(\d+\.\d%\) Time: (\d+:\d+:\d+|unknown), "
+            r"ETA: (~\d+:\d+:\d+|unknown)\] \S+",
         )
 
     @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
     def test_dynamic_progress_disabled_by_default(self):
-        # Without --dynamic-progress no progress line is displayed. The
-        # stderr may still carry unrelated output (e.g. the experimental
-        # scheduler warning, or the multiprocessing resource tracker of
-        # the interpreter), so only the progress line pattern is
-        # asserted against.
+        # Without --dynamic-progress no progress annotation is displayed
+        # on the trace output, and the workers stay silent on stderr.
         out, err = self.assertRunExit("stestr run --dynamic --concurrency 2 passing", 0)
-        self.assertNotRegex(err.decode(), r"\[\d+/\d+ \(\d+\.\d%\) elapsed:")
+        self.assertNotRegex(out.decode(), r"\[ \d+/\d+ \(\d+\.\d%\) ETA:")
+        self.assertNotRegex(err.decode(), r"\[ \d+/\d+ \(\d+\.\d%\) ETA:")
 
     @unittest.skipIf(sys.platform == "win32", "dynamic mode is not supported")
     def test_dynamic_subunit_passing(self):

@@ -14,6 +14,7 @@ import faulthandler
 import io
 import multiprocessing
 import os
+import queue
 import re
 import signal
 import subprocess
@@ -58,54 +59,12 @@ _DEBUG_WATCHDOG_INTERVAL = 30
 # the next one, so that their stack dumps do not interleave in the
 # shared debug stream.
 _DEBUG_WATCHDOG_DUMP_DELAY = 1
+# Seconds _terminate_dynamic_workers waits for a worker to exit before
+# terminating (and then killing) it.
+_DYNAMIC_JOIN_TIMEOUT = 5
 # The subunit test statuses that mark the end of a test. See the
 # status_mask of subunit.v2.StreamResultToBytes.
 _FINAL_TEST_STATUSES = frozenset(["success", "fail", "skip", "xfail", "uxsuccess"])
-
-
-def _format_progress_duration(seconds):
-    """Format a duration in seconds as a HH:MM:SS string."""
-    seconds = max(int(seconds), 0)
-    return "%02d:%02d:%02d" % (
-        seconds // 3600,
-        seconds % 3600 // 60,
-        seconds % 60,
-    )
-
-
-def _format_dynamic_progress(tests_done, total_tests, elapsed_seconds):
-    """Build the progress line displayed by the dynamic scheduler workers.
-
-    Each worker writes the line right before running its next group of
-    tests: it shows how many of the tests of the whole run already
-    completed, the corresponding percentage, the elapsed time of the run
-    and a rough ETA extrapolating the average duration of the completed
-    tests to the remaining ones. The ETA is unknown until the first group
-    of tests completes.
-
-    :param int tests_done: The number of tests already completed by the
-        run.
-    :param int total_tests: The total number of tests of the run.
-    :param float elapsed_seconds: Seconds elapsed since the run started.
-    :return: The progress line, without a trailing newline.
-    """
-    tests_done = max(min(tests_done, total_tests), 0)
-    percent = 100.0 * tests_done / total_tests if total_tests else 100.0
-    if tests_done >= total_tests > 0:
-        eta = "~00:00:00"
-    elif tests_done > 0:
-        eta = "~%s" % _format_progress_duration(
-            elapsed_seconds / tests_done * (total_tests - tests_done)
-        )
-    else:
-        eta = "unknown"
-    return "[%d/%d (%.1f%%) elapsed: %s, ETA: %s]" % (
-        tests_done,
-        total_tests,
-        percent,
-        _format_progress_duration(elapsed_seconds),
-        eta,
-    )
 
 
 class _DebugStreamResult:
@@ -225,7 +184,10 @@ def _dynamic_debug_watchdog(
     _dynamic_worker), so that a hung test can be located in the log.
     The dumps of concurrently signaled workers would interleave into
     an unreadable mix in the shared debug stream, so a worker is only
-    signaled once the previous dump had the time to land.
+    signaled once the previous dump had the time to land, and each
+    worker is signaled at most once per stall: the workers are
+    signaled again by a later stall, once the run made progress in
+    between and stalled again.
     The thread returns as soon as every worker exited.
 
     :param workers: The list of worker dicts built by run_tests(), each
@@ -236,7 +198,7 @@ def _dynamic_debug_watchdog(
     :param int interval: Seconds between two reports.
     :param debug_stream: The stream the reports are written to, defaults
         to sys.stderr.
-    :param stop_event: A threading.Event set by the fixture cleanup to
+    :param stop_event: A threading.Event set by the fixture finalizer to
         stop the watchdog promptly once the run ended.
     """
     if debug_stream is None:
@@ -244,6 +206,10 @@ def _dynamic_debug_watchdog(
     last_done = -1
     stalled_ticks = 0
     last_progress_time = time.monotonic()
+    # The workers already signaled during the current stall, so that a
+    # stalled run does not have its workers re-signaled (and their
+    # stacks re-dumped) on every tick of the same stall.
+    signaled = set()
     while True:
         if stop_event is not None:
             if stop_event.wait(interval):
@@ -294,9 +260,23 @@ def _dynamic_debug_watchdog(
                 # concurrently signaled workers would interleave. The
                 # header names the worker, and the next worker is only
                 # signaled once the previous dump had the time to land.
-                for i, w in enumerate(alive):
-                    if i:
+                # Each worker is signaled at most once per stall: the
+                # signaled set is cleared when the run makes progress,
+                # so a later stall signals the workers again, but a
+                # stalled run does not have its workers re-signaled (and
+                # their stacks re-dumped) on every tick of the same
+                # stall.
+                for w in alive:
+                    if not w["proc"].is_alive():
+                        # A previous dump may have unblocked the worker
+                        # (or made it crash): only signal the ones that
+                        # are still alive.
+                        continue
+                    if w["proc"] in signaled:
+                        continue
+                    if signaled:
                         time.sleep(_DEBUG_WATCHDOG_DUMP_DELAY)
+                    signaled.add(w["proc"])
                     debug_stream.write(
                         "[stestr-dbg] watchdog: dumping stacks of %s\n" % w["proc"].name
                     )
@@ -308,6 +288,7 @@ def _dynamic_debug_watchdog(
         else:
             stalled_ticks = 0
             last_progress_time = time.monotonic()
+            signaled.clear()
         last_done = done
         debug_stream.flush()
 
@@ -320,11 +301,8 @@ def _dynamic_worker(
     debug=False,
     debug_stream=None,
     groups_done=None,
-    tests_done=None,
-    run_start=None,
-    total_tests=0,
-    progress=False,
-    last_percent=None,
+    report_missing_ids=True,
+    errors_reported=None,
 ):
     """Run the groups of test ids from a queue until the sentinel.
 
@@ -357,25 +335,18 @@ def _dynamic_worker(
     :param groups_done: A multiprocessing.Value shared with the parent
         process, incremented after every completed group of tests.
         Optional.
-    :param tests_done: A multiprocessing.Value shared with the parent
-        process, incremented with the size of every completed group of
-        tests. Optional.
-    :param run_start: A multiprocessing.Value shared with the parent
-        process, set by the parent to the time.time() at which the run
-        started. Used with tests_done to display the progress of the
-        run. Optional.
-    :param int total_tests: The total number of tests scheduled for the
-        run, used with tests_done to display the progress of the run.
-    :param bool progress: Display the progress of the run on stderr
-        before running each next group of tests. Off by default: the
-        display is opt-in with the --dynamic-progress option of
-        stestr run.
-    :param last_percent: A multiprocessing.Value shared with the other
-        workers of the run, holding the last percentage step that was
-        displayed. A progress line is only displayed when the percentage
-        advances, so that at most one line is written per percentage
-        step across all the workers. Optional: without it every progress
-        line is displayed.
+    :param bool report_missing_ids: Report the test ids of a group that
+        the discovery of the worker did not find as failed tests. On by
+        default. When the id list was supplied by the user (--failing or
+        --load-list) rather than produced by the listing of the project,
+        a missing id is expected (the test may have been renamed since
+        the list was written) and must not fail the run: pass False.
+    :param errors_reported: A multiprocessing.Value shared with the
+        other workers of the run, used as a flag so that the discovery
+        import errors are reported by the first worker that hits them
+        only: the workers of a run all discover the same tree, and one
+        synthetic failure test per worker would repeat the same errors
+        once per worker. Optional.
     """
     # NOTE(mtreinish): Duplicate the file descriptor of the pipe so the
     # writer is decoupled from the Connection object's lifetime. Without
@@ -406,10 +377,13 @@ def _dynamic_worker(
     if debug:
         if debug_stream is None:
             debug_stream = sys.stderr
-        # NOTE: The dump handler replaces any handler registered before
-        # (e.g. by the code of the project under test at discovery time)
-        # and does not chain to it: the worker must keep running after a
-        # dump, since a slow test must not be killed by it.
+        # NOTE: The handler is registered before the discovery runs, so
+        # that a handler registered later by the code of the project
+        # under test (e.g. at discovery time) REPLACES this one instead
+        # of being replaced by it: the stack dumps of the watchdog must
+        # not steal the signal from a handler the project installed for
+        # its own debugging. The worker keeps running after a dump, so
+        # a slow test must not be killed by it.
         faulthandler.register(signal.SIGUSR1, file=debug_stream, all_threads=True)
         worker_name = multiprocessing.current_process().name
         picked_groups = 0
@@ -437,57 +411,29 @@ def _dynamic_worker(
                 # The discovery failed to import some modules: report the
                 # errors like the non-dynamic runner reports them, so
                 # that the run fails instead of silently dropping the
-                # tests of those modules.
-                _emit_subunit_failure(
-                    stdout_wrapper,
-                    "stestr-worker-import-errors",
-                    "\n".join(loader.errors),
-                )
-
-        def _count_tests_done(count):
-            # Add the size of a completed group to the shared counter of
-            # the run. Returns True when the whole run is completed, so
-            # that the caller displays the final progress line.
-            if tests_done is None or not total_tests:
-                return False
-            with tests_done.get_lock():
-                tests_done.value += count
-                return tests_done.value >= total_tests
-
-        def _write_progress_line(tests_done_value):
-            if not progress:
-                return
-            if last_percent is not None:
-                # The workers share the last printed percentage: a line
-                # is only displayed when the percentage advances, so a
-                # run without a group regex does not print one line per
-                # test.
-                percent = (
-                    int(100 * min(tests_done_value, total_tests) / total_tests)
-                    if total_tests
-                    else 100
-                )
-                with last_percent.get_lock():
-                    if percent <= last_percent.value:
-                        return
-                    last_percent.value = percent
-            elapsed = max(time.time() - run_start.value, 0.0)
-            sys.stderr.write(
-                "%s\n"
-                % _format_dynamic_progress(tests_done_value, total_tests, elapsed)
-            )
-            sys.stderr.flush()
+                # tests of those modules. Only the first worker that
+                # hits them reports them: the workers of a run all
+                # discover the same tree, and one synthetic failure test
+                # per worker would repeat the same errors once per
+                # worker.
+                if errors_reported is not None:
+                    with errors_reported.get_lock():
+                        report_errors = errors_reported.value == 0
+                        if report_errors:
+                            errors_reported.value = 1
+                else:
+                    report_errors = True
+                if report_errors:
+                    _emit_subunit_failure(
+                        stdout_wrapper,
+                        "stestr-worker-import-errors",
+                        "\n".join(loader.errors),
+                    )
 
         while True:
             group = job_queue.get()
             if group is None:
                 break
-            # Display the completion of the run on stderr before running
-            # the next group of tests.
-            if tests_done is not None and run_start is not None and total_tests:
-                with tests_done.get_lock():
-                    done = tests_done.value
-                _write_progress_line(done)
             if debug:
                 picked_groups += 1
                 debug_stream.write(
@@ -501,6 +447,14 @@ def _dynamic_worker(
                     try:
                         tests.append(test_map[test_id])
                     except KeyError:
+                        if not report_missing_ids:
+                            # The id list was supplied by the user
+                            # (--failing or --load-list) rather than
+                            # produced by the listing of the project: a
+                            # missing id is expected (the test may have
+                            # been renamed since the list was written)
+                            # and must not fail the run.
+                            continue
                         # The id is not in the discovery of the worker:
                         # report it as a failure instead of silently
                         # dropping it and counting it as done (e.g. a
@@ -520,8 +474,6 @@ def _dynamic_worker(
                     if groups_done is not None:
                         with groups_done.get_lock():
                             groups_done.value += 1
-                    if _count_tests_done(len(group)):
-                        _write_progress_line(tests_done.value)
                     continue
             else:
                 tests = [
@@ -543,8 +495,6 @@ def _dynamic_worker(
             if groups_done is not None:
                 with groups_done.get_lock():
                     groups_done.value += 1
-            if _count_tests_done(len(group)):
-                _write_progress_line(tests_done.value)
     finally:
         # Flush the wrapper, not sys.stdout: a test may have left a
         # replaced sys.stdout behind, and it must not break the flush of
@@ -604,15 +554,10 @@ class TestProcessorFixture(fixtures.Fixture):
     :param bool dynamic: Use the experimental dynamic scheduler, workers
         will ask for the next test to run instead of being assigned a
         partition up front.
-    :param bool dynamic_progress: Display the completion of a dynamic
-        run (tests done, percentage, elapsed time and a rough ETA) on
-        stderr before running each next group of tests. Off by default:
-        the display is opt-in. Only used when dynamic is true.
-    :param bool dynamic_progress_rate_limit: Rate limit the dynamic run
-        progress display to at most one line per percentage step of the
-        run across all the workers, instead of one line per group. The
-        workers share the last displayed percentage to that end. Implies
-        dynamic_progress. Only used when dynamic is true.
+    :param bool dynamic_progress: Annotate the output of a dynamic run
+        with the progress of the run (tests done, percentage and a rough
+        ETA) next to each test. Off by default: the display is opt-in.
+        Only used when dynamic is true.
     :param bool dynamic_debug: Enable the debug output of the dynamic
         scheduler (see the --dynamic-debug option of stestr run): each
         worker logs its progress to stderr and a watchdog thread
@@ -645,14 +590,15 @@ class TestProcessorFixture(fixtures.Fixture):
         randomize=False,
         dynamic=False,
         dynamic_progress=False,
-        dynamic_progress_rate_limit=False,
         dynamic_debug=False,
+        report_missing_ids=True,
         test_path=None,
         top_dir=None,
     ):
         """Create a TestProcessorFixture."""
 
         self.test_ids = test_ids
+        self.report_missing_ids = report_missing_ids
         self.template = cmd_template
         self.listopt = listopt
         self.idoption = idoption
@@ -671,8 +617,7 @@ class TestProcessorFixture(fixtures.Fixture):
         self.exclude_regex = exclude_regex
         self.randomize = randomize
         self.dynamic = dynamic
-        self.dynamic_progress = dynamic_progress or dynamic_progress_rate_limit
-        self.dynamic_progress_rate_limit = dynamic_progress_rate_limit
+        self.dynamic_progress = dynamic_progress
         self.dynamic_debug = dynamic_debug
         self._debug_stop = None
         self.test_path = test_path
@@ -681,15 +626,17 @@ class TestProcessorFixture(fixtures.Fixture):
     def setUp(self):
         super().setUp()
         if self.dynamic:
-            # The listing process and the workers must generate the same
-            # test ids: ddt and similar test generators derive the
-            # generated ids from the iteration order of sets (e.g.
-            # @ddt.data(*a_frozenset)), which depends on the per-process
-            # hash seed. All the child processes inherit this environment,
-            # so share one seed. 0 also keeps the ids stable across runs,
-            # which the repository data (timings, failures) relies on. A
-            # seed the user set explicitly is honored.
-            os.environ.setdefault("PYTHONHASHSEED", "0")
+            # One finalizer for the whole lifetime of the fixture: a
+            # --until-failure run calls run_tests() repeatedly on the
+            # same fixture, so the dynamic state of an iteration is
+            # finished when the next iteration starts (see
+            # _finish_dynamic_run), and this cleanup is the safety net
+            # for the last iteration and for abnormal exits. Registering
+            # the cleanups per run_tests() call would accumulate them
+            # (and leak worker processes, stream fds and watchdog
+            # threads) across the iterations.
+            self.addCleanup(self._finish_dynamic_run)
+            self._dynamic_join_timeout = _DYNAMIC_JOIN_TIMEOUT
         variable_regex = r"\$(IDOPTION|IDFILE|IDLIST|LISTOPT)"
         variables = {}
         list_variables = {"LISTOPT": self.listopt}
@@ -717,6 +664,8 @@ class TestProcessorFixture(fixtures.Fixture):
                 self.concurrency = scheduler.local_concurrency()
             if not self.concurrency:
                 self.concurrency = 1
+        if self.dynamic:
+            self._prepare_dynamic_hash_seed()
         if self.test_ids is None:
             if self.concurrency == 1:
                 if default_idstr:
@@ -753,6 +702,31 @@ class TestProcessorFixture(fixtures.Fixture):
             idoption = re.sub(variable_regex, subst, self.idoption)
             variables["IDOPTION"] = idoption
         self.cmd = re.sub(variable_regex, subst, cmd)
+
+    def _prepare_dynamic_hash_seed(self):
+        """Share one hash seed between the children of a dynamic run.
+
+        The listing process and the workers must generate the same test
+        ids: ddt and similar test generators derive the generated ids
+        from the iteration order of sets (e.g. @ddt.data(*a_frozenset)),
+        which depends on the per-process hash seed. All the child
+        processes inherit this environment, so they must share one seed.
+        0 also keeps the ids stable across runs, which the repository
+        data (timings, failures) relies on.
+
+        "random" and the empty value make every child process pick its
+        own seed, which makes the ids diverge between the workers, so
+        they are treated as unset. Any other value the user set
+        explicitly is honored. The variable is restored when the fixture
+        is torn down, and a run that degenerates to the classic serial
+        runner (concurrency 1) does not touch the environment at all,
+        since it spawns no worker.
+        """
+        if self.concurrency == 1:
+            return
+        current = os.environ.get("PYTHONHASHSEED")
+        if current is None or current in ("", "random"):
+            self.useFixture(fixtures.EnvironmentVariable("PYTHONHASHSEED", "0"))
 
     def make_listfile(self):
         name = None
@@ -822,36 +796,80 @@ class TestProcessorFixture(fixtures.Fixture):
         return ids
 
     def _terminate_dynamic_workers(self, workers):
-        """Terminate the dynamic workers that are still alive.
+        """Collect the dynamic scheduler workers.
 
-        Runs as a fixture cleanup: a run interrupted before the workers
+        Joins every worker, terminating (then killing) the ones that do
+        not exit on their own: a run interrupted before the workers
         consumed every group (e.g. Ctrl-C, or all the workers crashed
-        early) must not leave the worker processes behind.
+        early) must not leave worker processes behind, and a worker
+        blocked writing to a pipe nobody reads never exits on its own.
         """
         for worker in workers:
             proc = worker["proc"]
+            proc.join(timeout=self._dynamic_join_timeout)
             if proc.is_alive():
                 proc.terminate()
-            proc.join()
+                proc.join(timeout=self._dynamic_join_timeout)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=self._dynamic_join_timeout)
+
+    def _finish_dynamic_run(self):
+        """Finish a dynamic scheduler run.
+
+        Stops the feed thread and the watchdog, collects the worker
+        processes, closes their stream fds and releases the shared
+        objects.
+
+        Idempotent, and called from two places: at the beginning of
+        every dynamic run_tests() invocation, to finish the previous
+        iteration (a --until-failure run calls run_tests() repeatedly on
+        the same fixture, and the streams of an iteration are only fully
+        consumed after run_tests() returned, so the workers of an
+        iteration can only be collected once the next iteration starts),
+        and as a fixture cleanup, for the last iteration and for
+        abnormal exits (Ctrl-C, crashed workers) where no further
+        iteration happens.
+        """
+        feed_stop = getattr(self, "_dynamic_feed_stop", None)
+        if feed_stop is not None:
+            feed_stop.set()
+            self._dynamic_feed_stop = None
+        debug_stop = getattr(self, "_debug_stop", None)
+        if debug_stop is not None:
+            debug_stop.set()
+            self._debug_stop = None
+        workers = getattr(self, "_dynamic_workers", None) or []
+        self._dynamic_workers = []
+        self._terminate_dynamic_workers(workers)
+        for worker in workers:
+            stream = worker.get("stream")
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    # The stream may have been consumed and closed by the
+                    # caller already.
+                    pass
+            worker["stream"] = None
+        self._release_dynamic_shared_objects()
 
     def _release_dynamic_shared_objects(self):
         """Release the shared objects of the dynamic scheduler.
 
-        Runs as a fixture cleanup, after the workers are gone. Dropping
-        the references unlinks the underlying semaphores and unregisters
-        them from the multiprocessing resource tracker right away,
-        instead of at garbage collection or interpreter shutdown: the
-        resource tracker exits as soon as every process of the run is
+        Runs as part of _finish_dynamic_run, after the workers are gone.
+        Dropping the references unlinks the underlying semaphores and
+        unregisters them from the multiprocessing resource tracker right
+        away, instead of at garbage collection or interpreter shutdown:
+        the resource tracker exits as soon as every process of the run is
         gone, and an unregister message sent by a finalizer during the
         interpreter shutdown races with (and can be lost by) that exit,
         which makes the tracker warn about a leaked semaphore that was
         in fact already unlinked.
         """
         self._test_list_queue = None
-        self._tests_done = None
-        self._run_start = None
         self._total_tests = None
-        self._last_percent = None
+        self._errors_reported = None
 
     def run_tests(self):
         """Run the tests defined by the command
@@ -911,6 +929,14 @@ class TestProcessorFixture(fixtures.Fixture):
                 result.extend(fixture.run_tests())
             return result
         else:
+            # Finish the previous dynamic iteration, if any: a
+            # --until-failure run calls run_tests() repeatedly on the
+            # same fixture, and the streams of an iteration are only
+            # fully consumed after run_tests() returned, so the workers
+            # of an iteration can only be collected once the next
+            # iteration starts (or at fixture cleanup, for the last
+            # iteration).
+            self._finish_dynamic_run()
             test_id_list = scheduler.get_dynamic_test_list(
                 test_ids,
                 self.repository,
@@ -938,10 +964,6 @@ class TestProcessorFixture(fixtures.Fixture):
             # stopped consuming (e.g. an interrupted run, or workers dying
             # early): the pending groups are simply dropped.
             self._test_list_queue.cancel_join_thread()
-            # Registered before the cleanup terminating the workers, so
-            # that the shared objects are only released once the workers
-            # are gone (the cleanups run in reverse order).
-            self.addCleanup(self._release_dynamic_shared_objects)
 
             # The workers are started before the groups are fed to the
             # queue: the queue's internal semaphore is bounded by
@@ -951,32 +973,27 @@ class TestProcessorFixture(fixtures.Fixture):
             groups_done = None
             if self.dynamic_debug:
                 groups_done = context.Value("i", 0)
-            # The progress display counts completed tests in a shared
-            # counter, and reads the start time of the run from a shared
-            # value set by the parent before spawning the workers. Both
-            # are scoped to the instance like the queue above: if they
-            # were garbage collected while the workers are still
-            # starting, the finalizer of their locks would unlink the
-            # underlying semaphores and the workers would crash with a
-            # FileNotFoundError when rebuilding them.
-            tests_done = context.Value("i", 0)
-            run_start = context.Value("d", time.time())
-            total_tests = sum(len(group) for group in test_id_list)
-            # With the rate limited display, the workers share the last
-            # printed percentage, so that at most one line is displayed
-            # per percentage step across all the workers. Scoped to the
-            # instance like the other shared values above.
-            last_percent = None
-            if self.dynamic_progress_rate_limit:
-                last_percent = context.Value("i", -1)
-                self._last_percent = last_percent
-            self._tests_done = tests_done
-            self._run_start = run_start
-            self._total_tests = total_tests
+            # The total number of tests of the run, exposed for the
+            # parent to pass to the result rendering (the progress
+            # annotation of the run output is computed from the subunit
+            # stream itself, no shared counter is needed with the
+            # workers).
+            self._total_tests = sum(len(group) for group in test_id_list)
+            # Shared flag for the discovery import errors: the first
+            # worker that hits them reports them (the workers all
+            # discover the same tree, so the errors would be repeated
+            # once per worker otherwise).
+            errors_reported = context.Value("b", 0)
+            self._errors_reported = errors_reported
             # One worker per group at most: every worker runs a full
             # discovery of the test tree first, so spawning more workers
             # than groups would import the tree for nothing.
             num_workers = min(self.concurrency, len(test_id_list))
+            # The workers are tracked on the instance, and the cleanup
+            # collecting them was registered in setUp, before any of
+            # them is started: a crash during the spawn loop must not
+            # leave the already-started workers behind.
+            self._dynamic_workers = []
             for i in range(num_workers):
                 fd_pipe_r, fd_pipe_w = context.Pipe(False)
                 proc = context.Process(
@@ -990,11 +1007,8 @@ class TestProcessorFixture(fixtures.Fixture):
                         self.dynamic_debug,
                         None,
                         groups_done,
-                        tests_done,
-                        run_start,
-                        total_tests,
-                        self.dynamic_progress,
-                        last_percent,
+                        self.report_missing_ids,
+                        errors_reported,
                     ),
                 )
                 proc.start()
@@ -1002,27 +1016,53 @@ class TestProcessorFixture(fixtures.Fixture):
                 # immediately so the reader sees EOF as soon as the workers
                 # exit instead of only when the parent cleans up.
                 fd_pipe_w.close()
-                stream_read = os.dup(fd_pipe_r.fileno())
+                stream_read = os.fdopen(os.dup(fd_pipe_r.fileno()), "rb")
                 fd_pipe_r.close()
                 result.append({"stream": stream_read, "proc": proc})
-            # A run interrupted before the workers consumed every group
-            # (e.g. Ctrl-C, or all the workers crashing early) must not
-            # leave the worker processes behind: terminate any live one at
-            # fixture cleanup.
-            self.addCleanup(self._terminate_dynamic_workers, result)
-            for group in test_id_list:
-                self._test_list_queue.put(group)
-            # Enqueue a sentinel per worker. A worker exits when it receives
-            # a sentinel, so every worker exits only after all the test ids
-            # were handed to a worker.
-            for _ in range(num_workers):
-                self._test_list_queue.put(None)
+                self._dynamic_workers.append(result[-1])
+            # The groups are fed to the queue by a dedicated daemon
+            # thread instead of the main thread. The workers may be
+            # blocked writing to their stdout pipes, which the parent
+            # only starts reading after run_tests() returned; once the
+            # workers stop draining the queue, a synchronous feeding
+            # loop would block the main thread here before it ever
+            # reaches the read loop, deadlocking the whole run (the
+            # queue's internal buffer is bounded, and its semaphore by
+            # SEM_VALUE_MAX). The bounded put() timeout lets the feeder
+            # outlive slow consumers, and the stop event lets the
+            # finalizer abandon the feeding of an interrupted run.
+            feed_stop = threading.Event()
+            self._dynamic_feed_stop = feed_stop
+
+            def _feed_groups():
+                try:
+                    for item in list(test_id_list) + [None] * num_workers:
+                        while not feed_stop.is_set():
+                            try:
+                                self._test_list_queue.put(item, timeout=1)
+                                break
+                            except queue.Full:
+                                continue
+                        else:
+                            return
+                except Exception:
+                    # The queue is broken (e.g. every worker died and
+                    # its pipe was closed): the run is already failing
+                    # and the parent will see the EOF on the worker
+                    # streams, so drop the remaining groups.
+                    pass
+
+            self._dynamic_feed_thread = threading.Thread(
+                target=_feed_groups,
+                name="stestr-dynamic-feeder",
+                daemon=True,
+            )
+            self._dynamic_feed_thread.start()
             if self.dynamic_debug:
                 self._debug_stop = threading.Event()
-                # Stop the watchdog as soon as the fixture is cleaned up,
-                # so that it does not report one last time long after the
+                # The watchdog is stopped by the fixture finalizer, so
+                # that it does not report one last time long after the
                 # end of the run.
-                self.addCleanup(self._debug_stop.set)
                 threading.Thread(
                     target=_dynamic_debug_watchdog,
                     args=(result, groups_done, len(test_id_list)),

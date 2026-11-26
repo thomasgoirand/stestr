@@ -184,6 +184,8 @@ def load(
     serial=False,
     all_attachments=False,
     show_binary_attachments=False,
+    dynamic_progress_total=None,
+    worker_count=1,
 ):
     """Load subunit streams into a repository
 
@@ -212,6 +214,15 @@ def load(
         text attachments on successful test execution.
     :param bool show_binary_attachments: When set to true, subunit_trace will
         print binary attachments in addition to text attachments.
+    :param int dynamic_progress_total: The total number of tests of the
+        run, enabling the progress annotation of a dynamic scheduler run
+        (--dynamic-progress): with the pretty output the annotation is
+        displayed next to every test line, and on the raw subunit stream
+        output it is written to stderr for every completed test. None
+        (the default) disables the annotation.
+    :param int worker_count: The number of worker streams of the run, so
+        that the worker prefix of each result line is right-aligned on
+        the width of the largest worker number.
 
     :return return_code: The exit code for the command. 0 for success and > 0
         for failures.
@@ -284,6 +295,8 @@ def load(
                 suppress_attachments,
                 all_attachments,
                 show_binary_attachments,
+                dynamic_progress_total,
+                worker_count,
             )
             if result or retval:
                 retval = 1
@@ -303,6 +316,8 @@ def load(
             suppress_attachments,
             all_attachments,
             show_binary_attachments,
+            dynamic_progress_total,
+            worker_count,
         )
 
     return retval
@@ -320,7 +335,14 @@ def _load_case(
     suppress_attachments,
     all_attachments,
     show_binary_attachments,
+    dynamic_progress_total=None,
+    worker_count=1,
 ):
+    progress = (
+        subunit_trace.DynamicProgress(dynamic_progress_total)
+        if dynamic_progress_total
+        else None
+    )
     if subunit_out:
         output_result, summary_result = output.make_result(
             inserter.get_id, output=stdout
@@ -335,12 +357,14 @@ def _load_case(
                 suppress_attachments=suppress_attachments,
                 all_attachments=all_attachments,
                 show_binary_attachments=show_binary_attachments,
+                progress=progress,
+                worker_count=worker_count,
             )
         )
         summary_result = testtools.StreamSummary()
         output_result = testtools.CopyStreamResult([outcomes, summary_result])
         output_result = testtools.StreamResultRouter(output_result)
-        cat = subunit.test_results.CatFiles(stdout)
+        cat = subunit_trace.DiscardAttachments()
         output_result.add_rule(cat, "test_id", test_id=None)
     else:
         try:
@@ -349,7 +373,17 @@ def _load_case(
             previous_run = None
         output_result = results.CLITestResult(inserter.get_id, stdout, previous_run)
         summary_result = output_result.get_summary()
-    result = testtools.CopyStreamResult([inserter, output_result])
+    streamed_results = [inserter, output_result]
+    if progress is not None and (subunit_out or not pretty_out):
+        # On the raw subunit stream path (--subunit) and on the plain
+        # CLI output the per-test lines are rendered without the
+        # subunit-trace annotation: emit the progress of the run on
+        # stderr for every completed test instead, so that a --subunit
+        # pipeline keeps the per-test progress.
+        streamed_results.append(
+            subunit_trace.DynamicProgressReporter(progress, stream=sys.stderr)
+        )
+    result = testtools.CopyStreamResult(streamed_results)
     result.startTestRun()
     try:
         case.run(result)

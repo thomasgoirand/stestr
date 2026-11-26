@@ -105,9 +105,12 @@ def construct_list(
     :param str include_list: The path to an inclusion_list file
     :param str exclude_regex: regex pattern to exclude tests
 
-    :return: iterable of strings. The strings are full
-        test_ids
-    :rtype: set
+    :return: list of strings. The strings are full test_ids, in the order
+        they appear in test_ids. The order is meaningful: it is the order
+        the tests are handed to the runner and executed in (e.g. the
+        shuffled list of --random, or the candidate-then-failing probe
+        order of --analyze-isolation).
+    :rtype: list
     """
 
     if not regexes:
@@ -146,7 +149,7 @@ def construct_list(
     set_of_test_cases = set(list_of_test_cases)
 
     if not exclude_data:
-        return set_of_test_cases
+        return list(dict.fromkeys(list_of_test_cases))
 
     # NOTE(afazekas): We might use a faster logic when the
     # print option is not requested
@@ -159,4 +162,8 @@ def construct_list(
                     set_of_test_cases.remove(test_case)
                     s_list.append(test_case)
 
-    return set_of_test_cases
+    return [
+        test_case
+        for test_case in dict.fromkeys(list_of_test_cases)
+        if test_case in set_of_test_cases
+    ]

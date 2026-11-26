@@ -164,7 +164,9 @@ class ReturnCodeToSubunit:
         When dynamic is true, the read side of the subunit stream of a
         dynamic scheduler worker instead (a binary file object).
     :param worker: The multiprocessing.Process of the dynamic scheduler
-        worker that generated the stream. Only used when dynamic is true.
+        worker that generated the stream. Only used when dynamic is
+        true, and may be None when the stream is not tied to a worker
+        process (e.g. a merged stream).
     :param bool dynamic: Adapt the stream of a dynamic scheduler worker
         instead of a subprocess.Popen. Defaults to False.
     """
@@ -196,8 +198,13 @@ class ReturnCodeToSubunit:
         if not self.dynamic:
             returncode = self.proc.wait()
         else:
-            self.proc.join()
-            returncode = self.proc.exitcode
+            if self.proc is not None:
+                self.proc.join()
+                returncode = self.proc.exitcode
+            else:
+                # The stream is not tied to a worker process: there is no
+                # return code to report.
+                returncode = 0
         if returncode != 0:
             if self.lastoutput != b"\n":
                 # Subunit V1 is line orientated, it has to start on a fresh
